@@ -275,6 +275,7 @@ struct PhotoArchiveApp {
     metadata_results: Vec<MetadataRecord>,
     metadata_previous_results: Vec<MetadataRecord>,
     resolved_metadata_paths: std::collections::BTreeSet<PathBuf>,
+    accepted_metadata_warnings: BTreeMap<PathBuf, (MetadataStatus, MetadataStatus)>,
     duplicate_directory: Option<PathBuf>,
     duplicate_options: DuplicateOptions,
     duplicate_report: Option<duplicates::DuplicateReport>,
@@ -1020,6 +1021,7 @@ impl PhotoArchiveApp {
                             self.metadata_results.clear();
                             self.metadata_previous_results.clear();
                             self.resolved_metadata_paths.clear();
+                            self.accepted_metadata_warnings.clear();
                         }
                         Err(error) => {
                             self.status = format!("无法读取所选目录 {}：{error}", path.display());
@@ -1072,10 +1074,19 @@ impl PhotoArchiveApp {
                         || item.time_status == MetadataStatus::ReadError
                 })
                 .count();
+            let accepted_warnings = accepted_metadata_warning_count(
+                &self.metadata_results,
+                &self.accepted_metadata_warnings,
+            );
+            let warnings = self
+                .metadata_results
+                .iter()
+                .filter(|item| metadata_record_is_warning(item))
+                .count();
             ui.separator();
             ui.label(format!(
-                "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 读取错误 {read_errors}",
-                self.metadata_results.len()
+                "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 警告 {warnings}（已接受 {accepted_warnings}）· 读取错误 {read_errors}",
+                self.metadata_results.len(),
             ));
             if !self.resolved_metadata_paths.is_empty() {
                 ui.colored_label(
@@ -1098,6 +1109,30 @@ impl PhotoArchiveApp {
                                     eframe::egui::Color32::DARK_GREEN,
                                     "RESOLVED · 本轮复查已转为有效",
                                 );
+                            }
+                            if metadata_record_is_warning(item) {
+                                let status_pair = (item.gps_status, item.time_status);
+                                let accepted = self.accepted_metadata_warnings.get(&item.path)
+                                    == Some(&status_pair);
+                                if accepted {
+                                    ui.colored_label(
+                                        eframe::egui::Color32::DARK_BLUE,
+                                        "ACCEPTED · 用户接受当前警告",
+                                    );
+                                }
+                                let button = if accepted {
+                                    "撤销接受"
+                                } else {
+                                    "接受当前警告"
+                                };
+                                if ui.button(button).clicked() {
+                                    if accepted {
+                                        self.accepted_metadata_warnings.remove(&item.path);
+                                    } else {
+                                        self.accepted_metadata_warnings
+                                            .insert(item.path.clone(), status_pair);
+                                    }
+                                }
                             }
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(format!(
@@ -2316,6 +2351,7 @@ impl PhotoArchiveApp {
             return;
         };
         self.metadata_previous_results.clear();
+        self.accepted_metadata_warnings.clear();
         self.invalidate_file_results_for_rescan();
         self.work_completed = 0;
         self.work_total = 0;
@@ -2972,6 +3008,19 @@ impl PhotoArchiveApp {
                         self.metadata_previous_results.clear();
                     }
                     self.metadata_results = results;
+                    let current_results = &self.metadata_results;
+                    let keep_unchecked_acceptances = cancelled;
+                    self.accepted_metadata_warnings.retain(|path, status_pair| {
+                        current_results
+                            .iter()
+                            .find(|item| &item.path == path)
+                            .is_some_and(|item| {
+                                (item.gps_status, item.time_status) == *status_pair
+                                    && metadata_record_is_warning(item)
+                            })
+                            || (keep_unchecked_acceptances
+                                && current_results.iter().all(|item| &item.path != path))
+                    });
                     let passed = self
                         .metadata_results
                         .iter()
@@ -2990,8 +3039,13 @@ impl PhotoArchiveApp {
                         .count();
                     let warnings = self
                         .metadata_results
-                        .len()
-                        .saturating_sub(passed + read_errors);
+                        .iter()
+                        .filter(|item| metadata_record_is_warning(item))
+                        .count();
+                    let accepted_warnings = accepted_metadata_warning_count(
+                        &self.metadata_results,
+                        &self.accepted_metadata_warnings,
+                    );
 
                     if cancelled {
                         self.status = format!(
@@ -3007,18 +3061,20 @@ impl PhotoArchiveApp {
                         self.apply_pending_stage();
                     } else {
                         self.status = format!(
-                            "元数据检查完成：{} 项 PASS，{} 项需人工查看，{} 项读取错误。{}",
+                            "元数据检查完成：{} 项 PASS，{} 项警告（已接受 {} 项），{} 项读取错误。{}",
                             passed,
                             warnings,
+                            accepted_warnings,
                             read_errors,
                             error.as_deref().unwrap_or("")
                         );
                         self.handoff_title = "元数据检查已完成".into();
                         self.handoff_description = format!(
-                            "已逐项读取 {} 个当前文件的真实元数据：GPS 与拍摄时间均有效 {} 项；警告或不支持 {} 项；读取错误 {} 项。EXIF、GPS 和拍摄时间结果只保留在本次会话内存中。{}",
+                            "已逐项读取 {} 个当前文件的真实元数据：GPS 与拍摄时间均有效 {} 项；警告 {} 项（用户已接受 {} 项）；读取错误 {} 项。EXIF、GPS 和拍摄时间结果只保留在本次会话内存中。{}",
                             self.metadata_results.len(),
                             passed,
                             warnings,
+                            accepted_warnings,
                             read_errors,
                             error.as_deref().unwrap_or("")
                         );
@@ -3221,6 +3277,7 @@ impl PhotoArchiveApp {
                         self.metadata_results.clear();
                         self.metadata_previous_results.clear();
                         self.resolved_metadata_paths.clear();
+                        self.accepted_metadata_warnings.clear();
                     }
                     self.work_running = false;
                     self.work_kind = None;
@@ -3728,6 +3785,7 @@ impl PhotoArchiveApp {
         self.metadata_results.clear();
         self.metadata_previous_results.clear();
         self.resolved_metadata_paths.clear();
+        self.accepted_metadata_warnings.clear();
         self.duplicate_report = None;
         self.clear_candidate_preview();
         self.clear_saved_review();
@@ -3839,6 +3897,7 @@ impl PhotoArchiveApp {
                 self.metadata_results.clear();
                 self.metadata_previous_results.clear();
                 self.resolved_metadata_paths.clear();
+                self.accepted_metadata_warnings.clear();
                 self.duplicate_report = None;
                 self.clear_saved_review();
                 self.backup_mappings.clear();
@@ -4247,6 +4306,36 @@ fn find_resolved_metadata_paths(
         })
         .map(|item| item.path.clone())
         .collect()
+}
+
+fn metadata_record_is_warning(item: &MetadataRecord) -> bool {
+    let has_warning = [item.gps_status, item.time_status]
+        .into_iter()
+        .any(|status| {
+            matches!(
+                status,
+                MetadataStatus::Missing
+                    | MetadataStatus::Partial
+                    | MetadataStatus::Invalid
+                    | MetadataStatus::Unsupported
+            )
+        });
+    has_warning
+        && item.gps_status != MetadataStatus::ReadError
+        && item.time_status != MetadataStatus::ReadError
+}
+
+fn accepted_metadata_warning_count(
+    results: &[MetadataRecord],
+    accepted: &BTreeMap<PathBuf, (MetadataStatus, MetadataStatus)>,
+) -> usize {
+    results
+        .iter()
+        .filter(|item| {
+            metadata_record_is_warning(item)
+                && accepted.get(&item.path) == Some(&(item.gps_status, item.time_status))
+        })
+        .count()
 }
 
 fn default_archive_name(source: &Path) -> String {
