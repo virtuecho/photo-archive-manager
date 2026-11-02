@@ -1,0 +1,930 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::SystemTime,
+};
+
+use sevenz_rust2::{
+    ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderMethod, Password,
+    encoder_options::AesEncoderOptions,
+};
+use sha2::{Digest, Sha256};
+
+use crate::{files, scan_sources};
+
+const BUFFER_SIZE: usize = 1024 * 1024;
+static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+pub struct ArchiveResult {
+    pub output: PathBuf,
+    pub volume_paths: Vec<PathBuf>,
+    pub volume_count: usize,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub archive_bytes: u64,
+    pub cleanup_warning: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ManifestFile<'a> {
+    path: &'a Path,
+    relative: &'a Path,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct ExpectedEntry {
+    directory: bool,
+    size: u64,
+    sha256: Option<String>,
+}
+
+struct RemoveOnDrop(Vec<PathBuf>);
+
+impl RemoveOnDrop {
+    fn track(&mut self, path: PathBuf) {
+        self.0.push(path);
+    }
+
+    fn remove_path(&mut self, path: &Path) -> std::io::Result<()> {
+        fs::remove_file(path)?;
+        self.0.retain(|tracked| tracked != path);
+        Ok(())
+    }
+
+    fn remove_now(&mut self) -> std::io::Result<()> {
+        let mut first_error = None;
+        for path in self.0.drain(..) {
+            if let Err(error) = fs::remove_file(path)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        for path in self.0.drain(..) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct VolumeReader {
+    files: Vec<File>,
+    lengths: Vec<u64>,
+    offsets: Vec<u64>,
+    total_len: u64,
+    position: u64,
+}
+
+impl VolumeReader {
+    fn open(paths: &[PathBuf]) -> io::Result<Self> {
+        if paths.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive volume list is empty",
+            ));
+        }
+        let mut files = Vec::with_capacity(paths.len());
+        let mut lengths = Vec::with_capacity(paths.len());
+        let mut offsets = Vec::with_capacity(paths.len());
+        let mut total_len = 0u64;
+        for path in paths {
+            let file = File::open(path)?;
+            offsets.push(total_len);
+            let length = file.metadata()?.len();
+            total_len = total_len.checked_add(length).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "archive volume sizes overflow")
+            })?;
+            files.push(file);
+            lengths.push(length);
+        }
+        Ok(Self {
+            files,
+            lengths,
+            offsets,
+            total_len,
+            position: 0,
+        })
+    }
+}
+
+impl Read for VolumeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.position >= self.total_len {
+            return Ok(0);
+        }
+        let volume_index = self
+            .offsets
+            .partition_point(|offset| *offset <= self.position)
+            .saturating_sub(1);
+        let local_position = self.position - self.offsets[volume_index];
+        let available =
+            (self.lengths[volume_index] - local_position).min(buffer.len() as u64) as usize;
+        self.files[volume_index].seek(SeekFrom::Start(local_position))?;
+        let count = self.files[volume_index].read(&mut buffer[..available])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "archive volume ended before its recorded size",
+            ));
+        }
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for VolumeReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.total_len) + i128::from(offset),
+        };
+        if target < 0 || target > i128::from(u64::MAX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid archive volume seek",
+            ));
+        }
+        self.position = target as u64;
+        Ok(self.position)
+    }
+}
+
+pub fn create_and_verify(
+    source: &Path,
+    output_directory: &Path,
+    archive_name: &str,
+    password: &str,
+    max_bytes: u64,
+    excluded_paths: &BTreeSet<PathBuf>,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(usize, usize, u64),
+) -> Result<ArchiveResult, String> {
+    let source = fs::canonicalize(source)
+        .map_err(|error| format!("无法解析归档来源 {}：{error}", source.display()))?;
+    let output_directory = fs::canonicalize(output_directory).map_err(|error| {
+        format!(
+            "无法解析归档输出目录 {}：{error}",
+            output_directory.display()
+        )
+    })?;
+    let excluded_paths = excluded_paths
+        .iter()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect::<BTreeSet<_>>();
+    if !source.is_dir() || !output_directory.is_dir() {
+        return Err("归档来源和输出位置都必须是现有文件夹。".into());
+    }
+    if source.starts_with(&output_directory) || output_directory.starts_with(&source) {
+        return Err("归档来源与输出目录相同或互相嵌套；请选择不重叠的位置。".into());
+    }
+    if password.is_empty() {
+        return Err("加密密码不能为空。".into());
+    }
+    if archive_name.is_empty()
+        || archive_name == "."
+        || archive_name == ".."
+        || Path::new(archive_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(archive_name)
+        || archive_name.contains(['/', '\\', ':'])
+    {
+        return Err("归档名称只能是单个文件名，不能包含路径或盘符。".into());
+    }
+    let archive_name = if archive_name.to_ascii_lowercase().ends_with(".7z") {
+        archive_name.to_string()
+    } else {
+        format!("{archive_name}.7z")
+    };
+    let output = output_directory.join(archive_name);
+    if max_bytes == 0 {
+        return Err("每卷大小必须大于 0。".into());
+    }
+    if fs::symlink_metadata(&output).is_ok()
+        || fs::symlink_metadata(volume_path(&output, 1, true)).is_ok()
+    {
+        return Err(format!(
+            "目标归档或首卷已存在，不会覆盖：{}",
+            output.display()
+        ));
+    }
+
+    let summary = scan_sources(&[source.clone()], cancel, |_| {})
+        .map_err(|_| "归档扫描已取消，未创建归档。".to_string())?;
+    if summary.error_count > 0 {
+        return Err(format!(
+            "来源扫描有 {} 项读取错误（例如 {}）；不能将不完整清单写入归档。",
+            summary.error_count,
+            summary
+                .error_samples
+                .first()
+                .map(String::as_str)
+                .unwrap_or("未提供")
+        ));
+    }
+    let top_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "来源文件夹名不是有效 UTF-8，无法安全写入 7z 清单。".to_string())?;
+    let files = summary
+        .files
+        .iter()
+        .filter(|file| !excluded_paths.contains(&file.path))
+        .map(|file| ManifestFile {
+            path: &file.path,
+            relative: &file.relative_path,
+            size: file.size,
+            modified: file.modified,
+        })
+        .collect::<Vec<_>>();
+    let total_bytes = files
+        .iter()
+        .fold(0u64, |sum, file| sum.saturating_add(file.size));
+    let initial_stamps = files
+        .iter()
+        .map(|file| (file.path.to_path_buf(), (file.size, file.modified)))
+        .collect::<BTreeMap<_, _>>();
+    let mut expected = BTreeMap::<String, ExpectedEntry>::new();
+    expected.insert(
+        top_name.to_string(),
+        ExpectedEntry {
+            directory: true,
+            size: 0,
+            sha256: None,
+        },
+    );
+    let mut processed_bytes = 0u64;
+    for (index, file) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("归档已取消，未创建归档。".into());
+        }
+        let name = archive_entry_name(top_name, file.relative)?;
+        let before = fs::metadata(file.path)
+            .map_err(|error| format!("无法读取来源 {}：{error}", file.path.display()))?;
+        if !before.is_file() || before.len() != file.size || before.modified().ok() != file.modified
+        {
+            return Err(format!(
+                "来源文件在扫描后发生变化：{}；请重新扫描。",
+                file.path.display()
+            ));
+        }
+        let sha256 = files::sha256_file(file.path)
+            .map_err(|error| format!("无法计算来源 SHA-256 {}：{error}", file.path.display()))?;
+        let after = fs::metadata(file.path)
+            .map_err(|error| format!("无法重新读取来源 {}：{error}", file.path.display()))?;
+        if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+            return Err(format!(
+                "来源文件在建立清单时发生变化：{}；请重新扫描。",
+                file.path.display()
+            ));
+        }
+        expected.insert(
+            name,
+            ExpectedEntry {
+                directory: false,
+                size: file.size,
+                sha256: Some(sha256),
+            },
+        );
+        processed_bytes = processed_bytes.saturating_add(file.size);
+        progress(
+            index + 1,
+            files.len().saturating_mul(4).max(1),
+            processed_bytes,
+        );
+    }
+
+    for directory in archive_directory_names(&source, top_name, cancel)? {
+        expected.entry(directory).or_insert(ExpectedEntry {
+            directory: true,
+            size: 0,
+            sha256: None,
+        });
+    }
+
+    let partial = loop {
+        let suffix = NEXT_PARTIAL.fetch_add(1, Ordering::Relaxed);
+        let partial = output_directory.join(format!(
+            ".{}.{}.{}.partial",
+            output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("archive"),
+            std::process::id(),
+            suffix
+        ));
+        if fs::symlink_metadata(&partial).is_err() {
+            break partial;
+        }
+    };
+    let mut cleanup = RemoveOnDrop(vec![partial.clone()]);
+    let mut writer =
+        ArchiveWriter::create(&partial).map_err(|error| format!("无法创建临时 7z：{error}"))?;
+    writer.set_content_methods(vec![
+        AesEncoderOptions::new(Password::from(password)).into(),
+        EncoderMethod::COPY.into(),
+    ]);
+    writer.set_encrypt_header(true);
+    for name in expected
+        .iter()
+        .filter_map(|(name, entry)| entry.directory.then_some(name))
+    {
+        writer
+            .push_archive_entry::<File>(ArchiveEntry::new_directory(name), None)
+            .map_err(|error| format!("无法写入目录 {name}：{error}"))?;
+    }
+    processed_bytes = 0;
+    for (index, file) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("归档已取消，临时输出已清理。".into());
+        }
+        let name = archive_entry_name(top_name, file.relative)?;
+        let mut input = File::open(file.path)
+            .map_err(|error| format!("无法打开来源 {}：{error}", file.path.display()))?;
+        let before = input
+            .metadata()
+            .map_err(|error| format!("无法检查来源 {}：{error}", file.path.display()))?;
+        if before.len() != file.size || before.modified().ok() != file.modified {
+            return Err(format!(
+                "来源文件在写入归档前发生变化：{}；请重新扫描。",
+                file.path.display()
+            ));
+        }
+        writer
+            .push_archive_entry(
+                ArchiveEntry::from_path(file.path, name.clone()),
+                Some(&mut input),
+            )
+            .map_err(|error| format!("归档文件 {} 失败：{error}", file.path.display()))?;
+        let after = input
+            .metadata()
+            .map_err(|error| format!("无法重新检查来源 {}：{error}", file.path.display()))?;
+        if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
+            return Err(format!(
+                "来源文件在写入归档时发生变化：{}；临时归档已清理。",
+                file.path.display()
+            ));
+        }
+        processed_bytes = processed_bytes.saturating_add(file.size);
+        progress(
+            files.len().saturating_add(index + 1),
+            files.len().saturating_mul(4).max(1),
+            processed_bytes,
+        );
+    }
+    writer
+        .finish()
+        .map_err(|error| format!("7z 编码器无法完成归档：{error}"))?;
+    File::open(&partial)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("无法同步临时归档：{error}"))?;
+
+    let final_scan = scan_sources(&[source.clone()], cancel, |_| {})
+        .map_err(|_| "归档过程中来源发生变化或扫描被取消；临时归档已清理。".to_string())?;
+    let final_files = final_scan
+        .files
+        .iter()
+        .filter(|file| !excluded_paths.contains(&file.path))
+        .collect::<Vec<_>>();
+    if final_scan.error_count > 0
+        || final_files.len() != files.len()
+        || final_files.iter().any(|current| {
+            initial_stamps.get(&current.path) != Some(&(current.size, current.modified))
+        })
+    {
+        return Err("归档过程中来源清单发生变化；临时归档已清理，请重新扫描后再试。".into());
+    }
+
+    let staged_volumes = split_archive_file(
+        &partial,
+        max_bytes,
+        &mut cleanup,
+        cancel,
+        |split_bytes, total_split_bytes| {
+            let file_units = files.len();
+            let split_units = if total_split_bytes == 0 {
+                file_units
+            } else {
+                ((split_bytes.saturating_mul(file_units as u64) + total_split_bytes - 1)
+                    / total_split_bytes) as usize
+            };
+            progress(
+                file_units.saturating_mul(2).saturating_add(split_units),
+                file_units.saturating_mul(4).max(1),
+                split_bytes,
+            );
+        },
+    )?;
+    if staged_volumes.len() > 1 {
+        cleanup
+            .remove_path(&partial)
+            .map_err(|error| format!("已拆分归档卷，但无法清理临时单文件：{error}"))?;
+    }
+    let archive_bytes = staged_volumes.iter().try_fold(0u64, |sum, path| {
+        fs::metadata(path)
+            .map(|metadata| sum.saturating_add(metadata.len()))
+            .map_err(|error| format!("无法读取临时归档卷 {}：{error}", path.display()))
+    })?;
+    verify_archive_volumes(
+        &staged_volumes,
+        password,
+        &expected,
+        files.len(),
+        &mut progress,
+    )?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("归档验证期间已取消；临时归档已清理。".into());
+    }
+    let final_paths = if staged_volumes.len() == 1 {
+        vec![output.clone()]
+    } else {
+        (1..=staged_volumes.len())
+            .map(|index| volume_path(&output, index, true))
+            .collect::<Vec<_>>()
+    };
+    if let Some(existing) = final_paths
+        .iter()
+        .find(|path| fs::symlink_metadata(path).is_ok())
+    {
+        return Err(format!(
+            "目标归档卷已存在，不会覆盖：{}",
+            existing.display()
+        ));
+    }
+    let mut committed = Vec::<PathBuf>::new();
+    for (staged, final_path) in staged_volumes.iter().zip(&final_paths) {
+        if let Err(error) = fs::hard_link(staged, final_path) {
+            let mut rollback_errors = Vec::new();
+            for path in &committed {
+                if let Err(error) = fs::remove_file(path) {
+                    rollback_errors.push(format!("{}：{error}", path.display()));
+                }
+            }
+            return Err(format!(
+                "无法安全提交归档卷 {}：{error}。{}",
+                final_path.display(),
+                if rollback_errors.is_empty() {
+                    "已回滚本轮提交的卷。".to_string()
+                } else {
+                    format!("回滚不完整：{}", rollback_errors.join("；"))
+                }
+            ));
+        }
+        committed.push(final_path.clone());
+    }
+    let cleanup_warning = cleanup
+        .remove_now()
+        .err()
+        .map(|error| format!("归档已提交，但临时卷未能清除：{error}"));
+    let output_path = final_paths
+        .first()
+        .cloned()
+        .unwrap_or_else(|| output.clone());
+    Ok(ArchiveResult {
+        output: output_path,
+        volume_paths: final_paths.clone(),
+        volume_count: final_paths.len(),
+        file_count: files.len(),
+        total_bytes,
+        archive_bytes,
+        cleanup_warning,
+    })
+}
+
+fn archive_entry_name(top_name: &str, relative: &Path) -> Result<String, String> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let value = component
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| format!("归档路径包含非 UTF-8 文件名：{}", relative.display()))?;
+        if value.is_empty() || value == "." || value == ".." || value.contains(['/', '\\']) {
+            return Err(format!(
+                "归档路径中包含不安全路径段：{}",
+                relative.display()
+            ));
+        }
+        components.push(value);
+    }
+    if components.is_empty() {
+        return Err("来源文件的相对路径为空。".into());
+    }
+    Ok(format!("{top_name}/{}", components.join("/")))
+}
+
+fn archive_directory_names(
+    root: &Path,
+    top_name: &str,
+    cancel: &AtomicBool,
+) -> Result<BTreeSet<String>, String> {
+    let mut names = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("归档目录扫描已取消。".into());
+        }
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("无法扫描目录 {}：{error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("无法读取目录 {} 中的项目：{error}", directory.display())
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("无法检查 {}：{error}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| format!("无法生成内部目录路径：{error}"))?;
+                names.insert(archive_entry_name(top_name, relative)?);
+                pending.push(path);
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn volume_path(base: &Path, index: usize, numbered: bool) -> PathBuf {
+    if !numbered {
+        return base.to_path_buf();
+    }
+    let name = base
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "archive.7z".into());
+    base.with_file_name(format!("{name}.{index:03}"))
+}
+
+fn split_archive_file(
+    archive: &Path,
+    max_bytes: u64,
+    cleanup: &mut RemoveOnDrop,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<Vec<PathBuf>, String> {
+    let total = fs::metadata(archive)
+        .map_err(|error| format!("无法读取临时归档 {}：{error}", archive.display()))?
+        .len();
+    if total <= max_bytes {
+        progress(total, total);
+        return Ok(vec![archive.to_path_buf()]);
+    }
+    let volume_count = usize::try_from(total.div_ceil(max_bytes))
+        .map_err(|_| "归档分卷数超过当前平台支持范围。".to_string())?;
+    let mut input = File::open(archive)
+        .map_err(|error| format!("无法打开待分卷归档 {}：{error}", archive.display()))?;
+    let mut paths = Vec::with_capacity(volume_count);
+    let mut copied = 0u64;
+    let mut next_progress = (max_bytes / 100).max(BUFFER_SIZE as u64);
+    let mut buffer = vec![0u8; BUFFER_SIZE.min(max_bytes as usize).max(1)];
+    for index in 1..=volume_count {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("归档分卷已取消；临时卷已清理。".into());
+        }
+        let path = volume_path(archive, index, true);
+        let output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("无法创建临时归档卷 {}：{error}", path.display()))?;
+        cleanup.track(path.clone());
+        paths.push(path.clone());
+        let mut output = output;
+        let mut in_volume = 0u64;
+        let volume_limit = (total - copied).min(max_bytes);
+        while in_volume < volume_limit {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("归档分卷已取消；临时卷已清理。".into());
+            }
+            let wanted = (volume_limit - in_volume).min(buffer.len() as u64) as usize;
+            let count = input
+                .read(&mut buffer[..wanted])
+                .map_err(|error| format!("读取归档分卷输入失败：{error}"))?;
+            if count == 0 {
+                return Err("临时归档在分卷过程中意外结束。".into());
+            }
+            output
+                .write_all(&buffer[..count])
+                .map_err(|error| format!("写入临时归档卷 {} 失败：{error}", path.display()))?;
+            copied = copied.saturating_add(count as u64);
+            in_volume = in_volume.saturating_add(count as u64);
+            if copied >= next_progress || copied == total {
+                progress(copied, total);
+                next_progress = copied.saturating_add((max_bytes / 100).max(BUFFER_SIZE as u64));
+            }
+        }
+        output
+            .sync_all()
+            .map_err(|error| format!("无法同步临时归档卷 {}：{error}", path.display()))?;
+    }
+    if copied != total {
+        return Err(format!(
+            "归档分卷总字节数不符：预期 {total}，实际 {copied}。"
+        ));
+    }
+    Ok(paths)
+}
+
+fn verify_archive_volumes(
+    paths: &[PathBuf],
+    password: &str,
+    expected: &BTreeMap<String, ExpectedEntry>,
+    file_count: usize,
+    progress: &mut impl FnMut(usize, usize, u64),
+) -> Result<(), String> {
+    let source =
+        VolumeReader::open(paths).map_err(|error| format!("无法打开完整归档卷序列：{error}"))?;
+    verify_archive_reader(source, password, expected, file_count, progress)
+}
+
+fn verify_archive_reader<R: Read + Seek>(
+    source: R,
+    password: &str,
+    expected: &BTreeMap<String, ExpectedEntry>,
+    file_count: usize,
+    progress: &mut impl FnMut(usize, usize, u64),
+) -> Result<(), String> {
+    let password = Password::from(password);
+    let mut reader = ArchiveReader::new(source, password)
+        .map_err(|error| format!("无法打开加密归档或密码不正确：{error}"))?;
+    let mut seen = BTreeSet::new();
+    let mut verification_errors = Vec::new();
+    let mut verified_files = 0usize;
+    let mut verified_bytes = 0u64;
+    reader
+        .for_each_entries(|entry, input| {
+            let name = entry.name().to_string();
+            if !seen.insert(name.clone()) {
+                verification_errors.push(format!("归档内存在重复路径：{name}"));
+                std::io::copy(input, &mut std::io::sink())?;
+                return Ok(true);
+            }
+            let Some(expected_entry) = expected.get(&name) else {
+                verification_errors.push(format!("归档中出现清单之外的路径：{name}"));
+                std::io::copy(input, &mut std::io::sink())?;
+                return Ok(true);
+            };
+            if entry.is_directory() != expected_entry.directory {
+                verification_errors.push(format!("归档路径类型不符：{name}"));
+                std::io::copy(input, &mut std::io::sink())?;
+                return Ok(true);
+            }
+            if expected_entry.directory {
+                return Ok(true);
+            }
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; BUFFER_SIZE];
+            let mut bytes = 0u64;
+            loop {
+                let count = input.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+                bytes = bytes.saturating_add(count as u64);
+            }
+            let digest = to_hex(&hasher.finalize());
+            if bytes != expected_entry.size || Some(digest) != expected_entry.sha256 {
+                verification_errors.push(format!(
+                    "归档内容与来源清单不符：{name}（预期 {} 字节）",
+                    expected_entry.size
+                ));
+            }
+            verified_files += 1;
+            verified_bytes = verified_bytes.saturating_add(bytes);
+            progress(
+                file_count.saturating_mul(3).saturating_add(verified_files),
+                file_count.saturating_mul(4).max(1),
+                verified_bytes,
+            );
+            Ok(true)
+        })
+        .map_err(|error| format!("7z 完整性读取测试失败：{error}"))?;
+
+    for name in expected.keys() {
+        if !seen.contains(name) {
+            verification_errors.push(format!("归档缺少清单项：{name}"));
+        }
+    }
+    if !verification_errors.is_empty() {
+        return Err(format!(
+            "7z 清单/逐文件 SHA-256 校验失败：{}",
+            verification_errors
+                .iter()
+                .take(8)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("；")
+        ));
+    }
+    if verified_files != file_count {
+        return Err(format!(
+            "归档中验证到 {verified_files} 个文件，预期 {file_count} 个。"
+        ));
+    }
+    Ok(())
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicBool, AtomicU64},
+    };
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn test_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "photo-archive-manager-archive-{}-{}",
+            std::process::id(),
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn creates_encrypted_store_with_root_and_stream_verifies_manifest() {
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(source.join("相机.JPG"), b"picture").unwrap();
+        fs::write(source.join("nested/MOV.MOV"), b"video bytes").unwrap();
+        let result = create_and_verify(
+            &source,
+            &output,
+            "Photos 2026_11_02.7z",
+            "中文-password",
+            2_000_000_000,
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.file_count, 2);
+        assert!(result.output.exists());
+        if let Some(destination) = std::env::var_os("PAM_TEST_ARCHIVE_OUTPUT") {
+            let destination = PathBuf::from(destination);
+            if result.volume_count == 1 {
+                fs::copy(&result.output, destination).unwrap();
+            } else {
+                for (index, volume) in result.volume_paths.iter().enumerate() {
+                    fs::copy(volume, volume_path(&destination, index + 1, true)).unwrap();
+                }
+            }
+        }
+        let mut reader =
+            ArchiveReader::open(&result.output, Password::from("中文-password")).unwrap();
+        let mut names = Vec::new();
+        reader
+            .for_each_entries(|entry, input| {
+                names.push(entry.name().to_string());
+                std::io::copy(input, &mut std::io::sink())?;
+                Ok(true)
+            })
+            .unwrap();
+        assert!(names.contains(&"Photos".to_string()));
+        assert!(names.contains(&"Photos/相机.JPG".to_string()));
+        assert!(names.contains(&"Photos/nested/MOV.MOV".to_string()));
+        assert!(!result.output.with_extension("7z.partial").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_existing_archive_and_output_inside_source() {
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let error = create_and_verify(
+            &source,
+            &source,
+            "archive.7z",
+            "pw",
+            2_000_000_000,
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("互相嵌套"));
+        fs::write(output.join("archive.7z"), b"existing").unwrap();
+        let error = create_and_verify(
+            &source,
+            &output,
+            "archive.7z",
+            "pw",
+            2_000_000_000,
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(error.contains("已存在"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn carries_only_explicit_exclusions_into_the_archive_manifest() {
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let keep = source.join("keep.jpg");
+        let exclude = source.join("exclude.jpg");
+        fs::write(&keep, b"keep").unwrap();
+        fs::write(&exclude, b"exclude").unwrap();
+        let excluded = BTreeSet::from([exclude]);
+        let result = create_and_verify(
+            &source,
+            &output,
+            "Photos.7z",
+            "pw",
+            2_000_000_000,
+            &excluded,
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.file_count, 1);
+        assert_eq!(result.total_bytes, 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn emits_numbered_split_volumes_below_the_selected_size_limit() {
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(source.join("large.mov"), b"more than four bytes").unwrap();
+
+        let result = create_and_verify(
+            &source,
+            &output,
+            "Photos.7z",
+            "pw",
+            100,
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(result.volume_count > 1);
+        assert!(
+            result
+                .output
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".001")
+        );
+        assert!(
+            result
+                .volume_paths
+                .iter()
+                .all(|path| fs::metadata(path).unwrap().len() <= 100)
+        );
+        assert!(
+            result
+                .volume_paths
+                .iter()
+                .take(result.volume_count - 1)
+                .all(|path| fs::metadata(path).unwrap().len() == 100)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}

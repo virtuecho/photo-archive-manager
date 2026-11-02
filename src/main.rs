@@ -11,6 +11,7 @@ use std::{
     time::SystemTime,
 };
 
+mod archive;
 mod duplicates;
 pub mod files;
 mod metadata;
@@ -21,6 +22,7 @@ use crate::{
     metadata::{MetadataRecord, MetadataStatus},
     pipeline::{CopyItemResult, RoutedFile, VerifyItemResult},
 };
+use zeroize::Zeroize;
 
 const STAGES: [&str; 8] = [
     "来源选择",
@@ -32,6 +34,12 @@ const STAGES: [&str; 8] = [
     "文件备份",
     "加密归档",
 ];
+
+const LICENSE_NOTICES: &str = include_str!("../resources/THIRD_PARTY_NOTICES.md");
+const EXIFTOOL_LICENSE: &str = include_str!("../resources/exiftool/Artistic-License-1.0.pod");
+const SEVENZ_LICENSE: &str = include_str!("../resources/licenses/Apache-2.0-sevenz-rust2.txt");
+const ZEROIZE_APACHE_LICENSE: &str = include_str!("../resources/licenses/Apache-2.0-zeroize.txt");
+const ZEROIZE_MIT_LICENSE: &str = include_str!("../resources/licenses/MIT-zeroize.txt");
 
 #[derive(Clone, Debug)]
 struct SourceRoot {
@@ -93,6 +101,7 @@ enum WorkKind {
     Metadata,
     Duplicates,
     Backup,
+    Archive,
 }
 
 enum MetadataInput {
@@ -149,6 +158,15 @@ enum WorkMessage {
         error: Option<String>,
         verify_only: bool,
     },
+    ArchiveProgress {
+        completed: usize,
+        total: usize,
+        bytes: u64,
+    },
+    ArchiveComplete {
+        result: Result<archive::ArchiveResult, String>,
+        cancelled: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +199,17 @@ impl Default for DuplicateOptions {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ArchiveOptions {
+    volume_mb: u32,
+}
+
+impl Default for ArchiveOptions {
+    fn default() -> Self {
+        Self { volume_mb: 2000 }
+    }
+}
+
 #[derive(Default)]
 struct PhotoArchiveApp {
     stage: usize,
@@ -209,6 +238,14 @@ struct PhotoArchiveApp {
     backup_mappings: Vec<BackupMapping>,
     backup_copies: Vec<CopyItemResult>,
     backup_verification: Vec<VerifyItemResult>,
+    archive_source: Option<PathBuf>,
+    archive_output_directory: Option<PathBuf>,
+    archive_name: String,
+    archive_name_custom: bool,
+    archive_password: String,
+    archive_confirmation: String,
+    archive_show_password: bool,
+    archive_options: ArchiveOptions,
     work_receiver: Option<Receiver<WorkMessage>>,
     work_cancel: Option<Arc<AtomicBool>>,
     work_kind: Option<WorkKind>,
@@ -218,6 +255,8 @@ struct PhotoArchiveApp {
     work_bytes: u64,
     status: String,
     show_handoff: bool,
+    show_licenses: bool,
+    license_choice: usize,
     handoff_title: String,
     handoff_description: String,
     show_switch_prompt: bool,
@@ -261,6 +300,8 @@ impl eframe::App for PhotoArchiveApp {
                                 self.duplicates_stage(ui);
                             } else if self.stage == 6 {
                                 self.backup_stage(ui);
+                            } else if self.stage == 7 {
+                                self.archive_stage(ui);
                             } else {
                                 self.incomplete_stage(ui);
                             }
@@ -276,6 +317,9 @@ impl eframe::App for PhotoArchiveApp {
         }
         if self.show_switch_prompt {
             self.stage_switch_dialog(&ctx);
+        }
+        if self.show_licenses {
+            self.license_dialog(&ctx);
         }
         if self.scanning || self.work_running || self.show_handoff || self.show_switch_prompt {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1002,7 +1046,7 @@ impl PhotoArchiveApp {
                 .text("拍摄时间窗口（秒）"),
             );
             ui.add(
-                eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=32)
+                eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=63)
                     .text("pHash 相似阈值（汉明距离）"),
             );
         });
@@ -1356,6 +1400,178 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn archive_stage(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.label("选择一个本地文件夹，生成内部含同名顶层目录的加密 7z Store 归档；完成后逐项核对归档清单并流式重算 SHA-256。");
+        ui.colored_label(
+            eframe::egui::Color32::from_rgb(40, 105, 40),
+            "超过单卷大小时会输出 .7z.001/.002… 卷集；它们是一份逻辑归档，请保持所有卷同目录并确保卷齐全。",
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("选择归档来源文件夹…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                match fs::canonicalize(&path) {
+                    Ok(path) => {
+                        let default_name = default_archive_name(&path);
+                        self.archive_source = Some(path);
+                        if !self.archive_name_custom {
+                            self.archive_name = default_name;
+                        }
+                    }
+                    Err(error) => {
+                        self.status = format!("无法读取归档来源 {}：{error}", path.display());
+                    }
+                }
+            }
+            ui.label(self.archive_source.as_deref().map_or_else(
+                || "尚未选择来源".to_string(),
+                |path| path.display().to_string(),
+            ));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("选择输出目录…").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                match fs::canonicalize(&path) {
+                    Ok(path) => self.archive_output_directory = Some(path),
+                    Err(error) => {
+                        self.status = format!("无法读取归档输出目录 {}：{error}", path.display());
+                    }
+                }
+            }
+            ui.label(self.archive_output_directory.as_deref().map_or_else(
+                || "尚未选择输出目录".to_string(),
+                |path| path.display().to_string(),
+            ));
+        });
+        ui.horizontal(|ui| {
+            ui.label("归档名称（默认日期为 UTC，可修改）");
+            if ui.text_edit_singleline(&mut self.archive_name).changed() {
+                self.archive_name_custom = true;
+            }
+            ui.label("（自动补 .7z）");
+        });
+        ui.add(
+            eframe::egui::Slider::new(&mut self.archive_options.volume_mb, 1..=2000)
+                .text("单卷上限（十进制 MB）"),
+        );
+        ui.weak("2000 MB = 2,000,000,000 字节。密码只用于当前归档任务；不会写入文件名、进程参数或报告。归档采用 Store（不压缩）、AES-256 和加密文件名。");
+        if !self.excluded_final_paths.is_empty() {
+            ui.weak(format!(
+                "携带了 {} 个阶段⑥排除标记；归档扫描遇到同一绝对路径时会从输入清单排除。",
+                self.excluded_final_paths.len()
+            ));
+        }
+        ui.horizontal(|ui| {
+            ui.label("密码");
+            ui.add(
+                eframe::egui::TextEdit::singleline(&mut self.archive_password)
+                    .password(!self.archive_show_password)
+                    .desired_width(240.0),
+            );
+            ui.label("确认密码");
+            ui.add(
+                eframe::egui::TextEdit::singleline(&mut self.archive_confirmation)
+                    .password(!self.archive_show_password)
+                    .desired_width(240.0),
+            );
+            ui.checkbox(&mut self.archive_show_password, "显示");
+            if ui.button("清空密码").clicked() {
+                self.archive_password.zeroize();
+                self.archive_confirmation.zeroize();
+            }
+        });
+        let ready = self.archive_source.is_some()
+            && self.archive_output_directory.is_some()
+            && !self.archive_name.trim().is_empty()
+            && !self.archive_password.is_empty()
+            && self.archive_password == self.archive_confirmation;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.work_running && ready,
+                    eframe::egui::Button::new("创建并验证加密归档"),
+                )
+                .clicked()
+            {
+                self.start_archive();
+            }
+            if self.work_running
+                && self.work_kind == Some(WorkKind::Archive)
+                && ui.button("取消归档").clicked()
+                && let Some(cancel) = &self.work_cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        if !self.archive_password.is_empty()
+            && !self.archive_confirmation.is_empty()
+            && self.archive_password != self.archive_confirmation
+        {
+            ui.colored_label(eframe::egui::Color32::DARK_RED, "两次输入的密码不一致。");
+        }
+        if !self.status.is_empty() {
+            ui.label(&self.status);
+        }
+    }
+
+    fn start_archive(&mut self) {
+        if self.work_running {
+            return;
+        }
+        let (Some(source), Some(output_directory)) = (
+            self.archive_source.clone(),
+            self.archive_output_directory.clone(),
+        ) else {
+            self.status = "请先选择归档来源文件夹和输出目录。".into();
+            return;
+        };
+        if self.archive_password.is_empty() || self.archive_password != self.archive_confirmation {
+            self.status = "归档密码不能为空，且两次输入必须一致。".into();
+            return;
+        }
+        let name = self.archive_name.trim().to_string();
+        let max_bytes = u64::from(self.archive_options.volume_mb) * 1_000_000;
+        let excluded_paths = self.excluded_final_paths.clone();
+        let mut password = std::mem::take(&mut self.archive_password);
+        self.archive_confirmation.zeroize();
+        self.archive_show_password = false;
+        self.work_completed = 0;
+        self.work_total = 0;
+        self.work_bytes = 0;
+        self.work_kind = Some(WorkKind::Archive);
+        self.work_running = true;
+        self.status = "正在扫描、建立哈希清单并创建临时加密归档…".into();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.work_receiver = Some(receiver);
+        self.work_cancel = Some(cancel);
+        thread::spawn(move || {
+            let result = archive::create_and_verify(
+                &source,
+                &output_directory,
+                &name,
+                &password,
+                max_bytes,
+                &excluded_paths,
+                &worker_cancel,
+                |completed, total, bytes| {
+                    let _ = sender.send(WorkMessage::ArchiveProgress {
+                        completed,
+                        total,
+                        bytes,
+                    });
+                },
+            );
+            password.zeroize();
+            let _ = sender.send(WorkMessage::ArchiveComplete {
+                result,
+                cancelled: worker_cancel.load(Ordering::Relaxed),
+            });
+        });
+    }
+
     fn start_backup(&mut self, verify_only: bool) {
         if self.work_running {
             return;
@@ -1388,6 +1604,8 @@ impl PhotoArchiveApp {
         self.work_cancel = Some(cancel);
         thread::spawn(move || {
             let mut items = Vec::<RoutedFile>::new();
+            let mut expected_by_target =
+                BTreeMap::<PathBuf, (PathBuf, std::collections::BTreeSet<PathBuf>)>::new();
             let mut error = None;
             let mut excluded_count = 0usize;
             for mapping in mappings {
@@ -1436,6 +1654,11 @@ impl PhotoArchiveApp {
                         continue;
                     }
                     for target in &mapping.targets {
+                        expected_by_target
+                            .entry(target.clone())
+                            .or_insert_with(|| (source.clone(), std::collections::BTreeSet::new()))
+                            .1
+                            .insert(file.relative_path.clone());
                         items.push(RoutedFile {
                             source: file.path.clone(),
                             destination: target.join(&file.relative_path),
@@ -1482,6 +1705,16 @@ impl PhotoArchiveApp {
                             bytes: 0,
                         });
                     });
+                let mut verification = verification;
+                let (extra_results, target_error) =
+                    inspect_backup_targets(&expected_by_target, &worker_cancel);
+                verification.extend(extra_results);
+                if let Some(target_error) = target_error {
+                    error = Some(match error {
+                        Some(error) => format!("{error}；{target_error}"),
+                        None => target_error,
+                    });
+                }
                 let _ = sender.send(WorkMessage::BackupComplete {
                     copies: Vec::new(),
                     verification,
@@ -1513,6 +1746,16 @@ impl PhotoArchiveApp {
                         bytes: 0,
                     });
                 });
+            let mut verification = verification;
+            let (extra_results, target_error) =
+                inspect_backup_targets(&expected_by_target, &worker_cancel);
+            verification.extend(extra_results);
+            if let Some(target_error) = target_error {
+                error = Some(match error {
+                    Some(error) => format!("{error}；{target_error}"),
+                    None => target_error,
+                });
+            }
             let _ = sender.send(WorkMessage::BackupComplete {
                 copies,
                 verification,
@@ -2216,6 +2459,57 @@ impl PhotoArchiveApp {
                     }
                     break;
                 }
+                Ok(WorkMessage::ArchiveProgress {
+                    completed,
+                    total,
+                    bytes,
+                }) => {
+                    self.work_completed = completed;
+                    self.work_total = total;
+                    self.work_bytes = bytes;
+                }
+                Ok(WorkMessage::ArchiveComplete { result, cancelled }) => {
+                    self.work_running = false;
+                    self.work_kind = None;
+                    self.work_receiver = None;
+                    self.work_cancel = None;
+                    match result {
+                        Ok(result) => {
+                            self.status = format!(
+                                "归档完成并通过逐文件 SHA-256 还原流校验：{} 个文件，{} 卷，输入 {}，归档 {}。{}",
+                                result.file_count,
+                                result.volume_count,
+                                format_bytes(result.total_bytes),
+                                format_bytes(result.archive_bytes),
+                                result.cleanup_warning.as_deref().unwrap_or("")
+                            );
+                            self.handoff_title = "加密归档已完成".into();
+                            self.handoff_description = format!(
+                                "已在临时目录完成归档清单和逐文件 SHA-256 读取校验，并防覆盖提交卷集：{}。验证文件 {} 项；输入 {}；总归档大小 {}。这套卷对应一个逻辑 7z 归档。{}",
+                                result
+                                    .volume_paths
+                                    .iter()
+                                    .map(|path| path.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("、"),
+                                result.file_count,
+                                format_bytes(result.total_bytes),
+                                format_bytes(result.archive_bytes),
+                                result.cleanup_warning.as_deref().unwrap_or("")
+                            );
+                            self.show_handoff = !self.apply_pending_stage();
+                        }
+                        Err(error) => {
+                            self.status = if cancelled {
+                                format!("归档已取消，临时文件已清理（如可访问）：{error}")
+                            } else {
+                                format!("归档未提交：{error}")
+                            };
+                            self.apply_pending_stage();
+                        }
+                    }
+                    break;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.work_running = false;
@@ -2257,6 +2551,9 @@ impl PhotoArchiveApp {
                     self.request_stage(index);
                 }
             }
+            if ui.button("开源许可").clicked() {
+                self.show_licenses = true;
+            }
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -2288,6 +2585,12 @@ impl PhotoArchiveApp {
                     }
                     Some(WorkKind::Backup) => format!(
                         "复制并校验 {} / {} 项，已写入 {}",
+                        self.work_completed,
+                        self.work_total,
+                        format_bytes(self.work_bytes)
+                    ),
+                    Some(WorkKind::Archive) => format!(
+                        "归档与验证 {} / {} 项，已处理 {}",
                         self.work_completed,
                         self.work_total,
                         format_bytes(self.work_bytes)
@@ -2490,6 +2793,43 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn license_dialog(&mut self, ctx: &eframe::egui::Context) {
+        let mut open = self.show_licenses;
+        eframe::egui::Window::new("开源许可与第三方声明")
+            .open(&mut open)
+            .default_size([760.0, 580.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                let choices = [
+                    "第三方声明",
+                    "ExifTool · Artistic License 1.0",
+                    "sevenz-rust2 · Apache-2.0",
+                    "zeroize · Apache-2.0",
+                    "zeroize · MIT",
+                ];
+                eframe::egui::ComboBox::from_label("查看文本")
+                    .selected_text(choices[self.license_choice.min(choices.len() - 1)])
+                    .show_ui(ui, |ui| {
+                        for (index, label) in choices.iter().enumerate() {
+                            ui.selectable_value(&mut self.license_choice, index, *label);
+                        }
+                    });
+                let text = match self.license_choice {
+                    1 => EXIFTOOL_LICENSE,
+                    2 => SEVENZ_LICENSE,
+                    3 => ZEROIZE_APACHE_LICENSE,
+                    4 => ZEROIZE_MIT_LICENSE,
+                    _ => LICENSE_NOTICES,
+                };
+                eframe::egui::ScrollArea::vertical()
+                    .max_height(500.0)
+                    .show(ui, |ui| {
+                        ui.add(eframe::egui::Label::new(text).wrap().selectable(true));
+                    });
+            });
+        self.show_licenses = open;
+    }
+
     fn request_stage(&mut self, stage: usize) {
         if stage == self.stage {
             return;
@@ -2498,6 +2838,11 @@ impl PhotoArchiveApp {
             self.pending_stage = Some(stage);
             self.show_switch_prompt = true;
         } else {
+            if self.stage == 7 && stage != 7 {
+                self.archive_password.zeroize();
+                self.archive_confirmation.zeroize();
+                self.archive_show_password = false;
+            }
             self.stage = stage;
         }
     }
@@ -2545,6 +2890,13 @@ impl PhotoArchiveApp {
             }
             _ => {}
         }
+    }
+}
+
+impl Drop for PhotoArchiveApp {
+    fn drop(&mut self) {
+        self.archive_password.zeroize();
+        self.archive_confirmation.zeroize();
     }
 }
 
@@ -2628,6 +2980,63 @@ fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
         }
     }
     errors.into_iter().collect()
+}
+
+fn inspect_backup_targets(
+    expected_by_target: &BTreeMap<PathBuf, (PathBuf, std::collections::BTreeSet<PathBuf>)>,
+    cancel: &AtomicBool,
+) -> (Vec<VerifyItemResult>, Option<String>) {
+    let mut results = Vec::new();
+    let mut warnings = Vec::new();
+    for (target, (source, expected_relative_paths)) in expected_by_target {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match scan_sources(std::slice::from_ref(target), cancel, |_| {}) {
+            Ok(summary) => {
+                if summary.error_count > 0 {
+                    warnings.push(format!(
+                        "扫描备份目标 {} 时有 {} 项读取错误",
+                        target.display(),
+                        summary.error_count
+                    ));
+                    results.push(VerifyItemResult {
+                        source: source.clone(),
+                        destination: target.clone(),
+                        result: Err(format!(
+                            "目标目录扫描有 {} 项读取错误；示例：{}",
+                            summary.error_count,
+                            summary
+                                .error_samples
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("未提供")
+                        )),
+                    });
+                }
+                for file in summary.files {
+                    if !expected_relative_paths.contains(&file.relative_path) {
+                        results.push(VerifyItemResult {
+                            source: source.clone(),
+                            destination: file.path,
+                            result: Err("目标包含不在本次来源清单中的额外文件。".into()),
+                        });
+                    }
+                }
+            }
+            Err(_) if cancel.load(Ordering::Relaxed) => break,
+            Err(_) => {
+                warnings.push(format!("无法完成目标扫描：{}", target.display()));
+                results.push(VerifyItemResult {
+                    source: source.clone(),
+                    destination: target.clone(),
+                    result: Err("目标扫描未完成；请检查磁盘连接和目录权限。".into()),
+                });
+            }
+        }
+    }
+    let warning = (!warnings.is_empty()).then(|| warnings.join("；"));
+    (results, warning)
 }
 
 fn scan_sources(
@@ -2740,6 +3149,39 @@ fn is_system_junk(relative_path: &Path) -> bool {
                 || name.eq_ignore_ascii_case("desktop.ini")
                 || name.starts_with("._")
         })
+}
+
+fn default_archive_name(source: &Path) -> String {
+    let folder = source
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "Archive".into());
+    format!("{folder} {}", utc_task_date())
+}
+
+fn utc_task_date() -> String {
+    let unix_days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86_400;
+    let days = i64::try_from(unix_days).unwrap_or(i64::MAX);
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}_{month:02}_{day:02}")
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -2939,6 +3381,33 @@ mod tests {
                 .all(|item| item.result.as_ref().is_ok_and(|result| result.matches))
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_recheck_reports_unexpected_target_files() {
+        let root = temp_dir();
+        let source = root.join("Library/Photos");
+        let target = root.join("Backup/Photos");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(source.join("IMG.JPG"), b"expected").unwrap();
+        fs::write(target.join("IMG.JPG"), b"expected").unwrap();
+        fs::write(target.join("old.jpg"), b"unexpected").unwrap();
+        let expected = BTreeMap::from([(
+            target.clone(),
+            (
+                source.clone(),
+                std::collections::BTreeSet::from([PathBuf::from("IMG.JPG")]),
+            ),
+        )]);
+
+        let (results, warning) = inspect_backup_targets(&expected, &AtomicBool::new(false));
+
+        assert!(warning.is_none());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].destination, target.join("old.jpg"));
+        assert!(results[0].result.as_ref().unwrap_err().contains("额外文件"));
         fs::remove_dir_all(root).unwrap();
     }
 }
