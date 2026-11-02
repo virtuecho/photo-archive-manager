@@ -11,6 +11,7 @@ use std::{
     time::SystemTime,
 };
 
+mod duplicates;
 pub mod files;
 mod metadata;
 mod pipeline;
@@ -90,6 +91,8 @@ enum WorkKind {
     Copy,
     Verify,
     Metadata,
+    Duplicates,
+    Backup,
 }
 
 enum MetadataInput {
@@ -125,6 +128,27 @@ enum WorkMessage {
         cancelled: bool,
         error: Option<String>,
     },
+    DuplicateProgress {
+        completed: usize,
+        total: usize,
+    },
+    DuplicateComplete {
+        report: duplicates::DuplicateReport,
+        cancelled: bool,
+        error: Option<String>,
+    },
+    BackupProgress {
+        completed: usize,
+        total: usize,
+        bytes: u64,
+    },
+    BackupComplete {
+        copies: Vec<CopyItemResult>,
+        verification: Vec<VerifyItemResult>,
+        cancelled: bool,
+        error: Option<String>,
+        verify_only: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +158,27 @@ struct VerifyCoverage {
     missing: Vec<String>,
     extra: Vec<String>,
     scan_errors: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DuplicateOptions {
+    time_threshold_seconds: u32,
+    phash_threshold: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BackupMapping {
+    source: Option<PathBuf>,
+    targets: Vec<PathBuf>,
+}
+
+impl Default for DuplicateOptions {
+    fn default() -> Self {
+        Self {
+            time_threshold_seconds: 5,
+            phash_threshold: 10,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -157,6 +202,13 @@ struct PhotoArchiveApp {
     direct_verify_target: Option<PathBuf>,
     metadata_directory: Option<PathBuf>,
     metadata_results: Vec<MetadataRecord>,
+    duplicate_directory: Option<PathBuf>,
+    duplicate_options: DuplicateOptions,
+    duplicate_report: Option<duplicates::DuplicateReport>,
+    excluded_final_paths: std::collections::BTreeSet<PathBuf>,
+    backup_mappings: Vec<BackupMapping>,
+    backup_copies: Vec<CopyItemResult>,
+    backup_verification: Vec<VerifyItemResult>,
     work_receiver: Option<Receiver<WorkMessage>>,
     work_cancel: Option<Arc<AtomicBool>>,
     work_kind: Option<WorkKind>,
@@ -205,6 +257,10 @@ impl eframe::App for PhotoArchiveApp {
                                 self.verification_stage(ui);
                             } else if self.stage == 4 {
                                 self.metadata_stage(ui);
+                            } else if self.stage == 5 {
+                                self.duplicates_stage(ui);
+                            } else if self.stage == 6 {
+                                self.backup_stage(ui);
                             } else {
                                 self.incomplete_stage(ui);
                             }
@@ -900,6 +956,672 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn duplicates_stage(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.label("重新扫描所选目录并读取可信拍摄时间。SHA-256 相同表示字节完全相同；时间接近与 pHash 只产生人工审核候选，不会自动删除文件。");
+        ui.horizontal(|ui| {
+            if ui.button("选择待检查目录…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    match fs::canonicalize(&path) {
+                        Ok(path) => {
+                            self.duplicate_directory = Some(path);
+                            self.duplicate_report = None;
+                            self.excluded_final_paths.clear();
+                        }
+                        Err(error) => {
+                            self.status = format!("无法读取所选目录 {}：{error}", path.display());
+                        }
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.work_running && self.duplicate_directory.is_some(),
+                    eframe::egui::Button::new("完整重新扫描并检查"),
+                )
+                .clicked()
+            {
+                self.start_duplicate_scan();
+            }
+            if self.work_running
+                && self.work_kind == Some(WorkKind::Duplicates)
+                && ui.button("取消重复检查").clicked()
+                && let Some(cancel) = &self.work_cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        if let Some(path) = &self.duplicate_directory {
+            ui.weak(format!("所选目录：{}", path.display()));
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                eframe::egui::Slider::new(
+                    &mut self.duplicate_options.time_threshold_seconds,
+                    0..=60,
+                )
+                .text("拍摄时间窗口（秒）"),
+            );
+            ui.add(
+                eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=32)
+                    .text("pHash 相似阈值（汉明距离）"),
+            );
+        });
+        ui.weak("时区未知的拍摄时间不会参与跨文件比较。视频仍参与 SHA-256 和时间候选，但不计算静态照片 pHash。当前离线解码器仅支持 JPEG/PNG，其余格式会显示原因。");
+        if !self.status.is_empty() {
+            ui.label(&self.status);
+        }
+
+        let Some(report) = &self.duplicate_report else {
+            return;
+        };
+        ui.separator();
+        ui.label(format!(
+            "精确重复组 {} · 时间候选 {} · 有效拍摄时间缺少时区 {} 项 · 因设备不同跳过 {} 对 · 已标记排除 {} 项",
+            report.exact_groups.len(),
+            report.time_candidates.len(),
+            report.unknown_timezone_count,
+            report.different_device_pairs_skipped,
+            self.excluded_final_paths.len()
+        ));
+        if report.time_candidates_truncated {
+            ui.colored_label(
+                eframe::egui::Color32::from_rgb(160, 90, 0),
+                "候选超过 100,000 对，结果已截断。请缩小目录范围后重新扫描。",
+            );
+        }
+        if !report.hash_errors.is_empty() {
+            ui.colored_label(
+                eframe::egui::Color32::DARK_RED,
+                format!("{} 个文件读取 SHA-256 失败。", report.hash_errors.len()),
+            );
+        }
+        if ui.button("清除本次排除标记（全部保留）").clicked() {
+            self.excluded_final_paths.clear();
+        }
+
+        eframe::egui::ScrollArea::vertical()
+            .id_salt("duplicate-report")
+            .max_height(480.0)
+            .show(ui, |ui| {
+                if !report.exact_groups.is_empty() {
+                    ui.heading("字节完全相同");
+                    for group in &report.exact_groups {
+                        ui.group(|ui| {
+                            ui.label(format!(
+                                "SHA-256 {} · {} 个路径",
+                                group.sha256,
+                                group.paths.len()
+                            ));
+                            for path in &group.paths {
+                                let mut exclude = self.excluded_final_paths.contains(path);
+                                if ui
+                                    .checkbox(
+                                        &mut exclude,
+                                        format!("排除本次最终清单：{}", path.display()),
+                                    )
+                                    .changed()
+                                {
+                                    if exclude {
+                                        self.excluded_final_paths.insert(path.clone());
+                                    } else {
+                                        self.excluded_final_paths.remove(path);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+                if !report.time_candidates.is_empty() {
+                    ui.add_space(8.0);
+                    ui.heading("拍摄时间候选（仅供人工复核）");
+                    for candidate in &report.time_candidates {
+                        ui.group(|ui| {
+                            ui.label(format!(
+                                "时间差 {:.3} 秒{}",
+                                candidate.delta_millis as f64 / 1000.0,
+                                candidate.phash_distance.map_or_else(
+                                    || " · 未计算 pHash".to_string(),
+                                    |distance| {
+                                        let class =
+                                            if distance <= self.duplicate_options.phash_threshold {
+                                                "视觉相似候选"
+                                            } else {
+                                                "视觉差异较大"
+                                            };
+                                        format!(" · pHash 汉明距离 {distance}/63 · {class}")
+                                    }
+                                )
+                            ));
+                            ui.label(format!(
+                                "A：{} · {}",
+                                candidate.first.display(),
+                                candidate.first_capture_time
+                            ));
+                            ui.weak(format!("SHA-256 {}", candidate.first_sha256));
+                            ui.label(format!(
+                                "B：{} · {}",
+                                candidate.second.display(),
+                                candidate.second_capture_time
+                            ));
+                            ui.weak(format!("SHA-256 {}", candidate.second_sha256));
+                            if let Some(note) = &candidate.phash_note {
+                                ui.colored_label(eframe::egui::Color32::from_rgb(160, 90, 0), note);
+                            }
+                            let mut exclude = self.excluded_final_paths.contains(&candidate.second);
+                            if ui
+                                .checkbox(
+                                    &mut exclude,
+                                    format!("排除本次最终清单：{}", candidate.second.display()),
+                                )
+                                .changed()
+                            {
+                                if exclude {
+                                    self.excluded_final_paths.insert(candidate.second.clone());
+                                } else {
+                                    self.excluded_final_paths.remove(&candidate.second);
+                                }
+                            }
+                        });
+                    }
+                }
+                for (path, error) in report.hash_errors.iter().take(50) {
+                    ui.colored_label(
+                        eframe::egui::Color32::DARK_RED,
+                        format!("SHA-256 失败：{}：{error}", path.display()),
+                    );
+                }
+                if report.hash_errors.len() > 50 {
+                    ui.weak(format!(
+                        "另有 {} 个读取错误未展开。",
+                        report.hash_errors.len() - 50
+                    ));
+                }
+            });
+    }
+
+    fn backup_stage(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.label("每行将一个本地整理文件夹映射到一个或多个独立备份目标。目标是最终文件夹本身；复制后会重新读取源与每个目标文件并逐项比较 SHA-256。此阶段可单独使用。");
+        if !self.excluded_final_paths.is_empty() {
+            ui.weak(format!(
+                "本次会话携带 {} 个阶段⑥排除标记；路径完全匹配的文件将从备份清单排除。",
+                self.excluded_final_paths.len()
+            ));
+        }
+        if ui
+            .add_enabled(
+                !self.work_running,
+                eframe::egui::Button::new("添加本地整理文件夹…"),
+            )
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                match fs::canonicalize(&path) {
+                    Ok(path) => self.backup_mappings.push(BackupMapping {
+                        source: Some(path),
+                        targets: Vec::new(),
+                    }),
+                    Err(error) => {
+                        self.status = format!("无法读取所选来源 {}：{error}", path.display());
+                    }
+                }
+            }
+        }
+
+        let mut remove_mapping = None;
+        for index in 0..self.backup_mappings.len() {
+            let mut mapping = self.backup_mappings[index].clone();
+            let mut remove_target = None;
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(format!("来源文件夹 {}", index + 1));
+                    if ui.button("移除此行").clicked() {
+                        remove_mapping = Some(index);
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("选择/更改来源…").clicked()
+                        && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    {
+                        match fs::canonicalize(&path) {
+                            Ok(path) => mapping.source = Some(path),
+                            Err(error) => {
+                                self.status = format!("无法读取来源 {}：{error}", path.display());
+                            }
+                        }
+                    }
+                    ui.label(mapping.source.as_deref().map_or_else(
+                        || "尚未选择来源".to_string(),
+                        |path| path.display().to_string(),
+                    ));
+                });
+                for (target_index, target) in mapping.targets.iter().enumerate() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("备份目标：{}", target.display()));
+                        if ui.button("移除目标").clicked() {
+                            remove_target = Some(target_index);
+                        }
+                    });
+                }
+                if ui.button("+ 添加备份目标文件夹…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    match fs::canonicalize(&path) {
+                        Ok(path) => {
+                            if !mapping.targets.contains(&path) {
+                                mapping.targets.push(path);
+                            }
+                        }
+                        Err(error) => {
+                            self.status = format!("无法读取备份目标 {}：{error}", path.display());
+                        }
+                    }
+                }
+            });
+            if let Some(target_index) = remove_target {
+                mapping.targets.remove(target_index);
+            }
+            self.backup_mappings[index] = mapping;
+        }
+        if let Some(index) = remove_mapping {
+            self.backup_mappings.remove(index);
+        }
+
+        let ready = self
+            .backup_mappings
+            .iter()
+            .any(|mapping| mapping.source.is_some() && !mapping.targets.is_empty());
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.work_running && ready,
+                    eframe::egui::Button::new("开始 / 重试复制并校验"),
+                )
+                .clicked()
+            {
+                self.start_backup(false);
+            }
+            if ui
+                .add_enabled(
+                    !self.work_running && ready,
+                    eframe::egui::Button::new("重新检查现有目标"),
+                )
+                .clicked()
+            {
+                self.start_backup(true);
+            }
+            if self.work_running
+                && self.work_kind == Some(WorkKind::Backup)
+                && ui.button("取消备份").clicked()
+                && let Some(cancel) = &self.work_cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        if !self.status.is_empty() {
+            ui.label(&self.status);
+        }
+        if !self.backup_verification.is_empty() {
+            ui.separator();
+            ui.heading("每个备份目标的当前校验");
+            for mapping in &self.backup_mappings {
+                for target in &mapping.targets {
+                    let copy_rows = self
+                        .backup_copies
+                        .iter()
+                        .filter(|item| item.destination.starts_with(target));
+                    let mut copy_ok = 0usize;
+                    let mut copy_failed = 0usize;
+                    for item in copy_rows {
+                        if item.result.is_ok() {
+                            copy_ok += 1;
+                        } else {
+                            copy_failed += 1;
+                        }
+                    }
+                    let rows = self
+                        .backup_verification
+                        .iter()
+                        .filter(|item| item.destination.starts_with(target));
+                    let mut passed = 0usize;
+                    let mut failed = 0usize;
+                    let mut examined = 0usize;
+                    for item in rows {
+                        examined += 1;
+                        if item.result.as_ref().is_ok_and(|result| result.matches) {
+                            passed += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    ui.label(format!(
+                        "{} · 复制成功 {copy_ok} / 失败 {copy_failed} · 读回校验 {passed} PASS / {failed} FAIL（{examined} 项）",
+                        target.display(),
+                    ));
+                }
+            }
+            eframe::egui::ScrollArea::vertical()
+                .id_salt("backup-results")
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    for item in self
+                        .backup_copies
+                        .iter()
+                        .filter(|item| item.result.is_err())
+                        .take(50)
+                    {
+                        ui.group(|ui| {
+                            ui.colored_label(eframe::egui::Color32::DARK_RED, "复制失败");
+                            ui.label(format!("源：{}", item.source.display()));
+                            ui.label(format!("目标：{}", item.destination.display()));
+                            if let Err(error) = &item.result {
+                                ui.colored_label(eframe::egui::Color32::DARK_RED, error);
+                            }
+                        });
+                    }
+                    for item in self.backup_verification.iter().take(100) {
+                        let matching = item.result.as_ref().is_ok_and(|result| result.matches);
+                        ui.group(|ui| {
+                            ui.colored_label(
+                                if matching {
+                                    eframe::egui::Color32::DARK_GREEN
+                                } else {
+                                    eframe::egui::Color32::DARK_RED
+                                },
+                                if matching { "PASS" } else { "FAIL" },
+                            );
+                            ui.label(format!("源：{}", item.source.display()));
+                            ui.label(format!("目标：{}", item.destination.display()));
+                            if let Ok(result) = &item.result
+                                && !result.matches
+                            {
+                                ui.weak(format!(
+                                    "源 {} / {} · 目标 {} / {}",
+                                    result.source_size,
+                                    result.source_sha256,
+                                    result.destination_size,
+                                    result.destination_sha256
+                                ));
+                            } else if let Err(error) = &item.result {
+                                ui.colored_label(eframe::egui::Color32::DARK_RED, error);
+                            }
+                        });
+                    }
+                    if self.backup_verification.len() > 100 {
+                        ui.weak(format!(
+                            "另有 {} 项未展开。",
+                            self.backup_verification.len() - 100
+                        ));
+                    }
+                });
+        }
+    }
+
+    fn start_backup(&mut self, verify_only: bool) {
+        if self.work_running {
+            return;
+        }
+        let mappings = self.backup_mappings.clone();
+        let invalid = backup_mapping_errors(&mappings);
+        if !invalid.is_empty() {
+            self.status = invalid.join("；");
+            return;
+        }
+        if !verify_only {
+            self.backup_copies.clear();
+        }
+        self.backup_verification.clear();
+        self.work_completed = 0;
+        self.work_total = 0;
+        self.work_bytes = 0;
+        self.work_kind = Some(WorkKind::Backup);
+        self.work_running = true;
+        self.status = if verify_only {
+            "正在重新扫描源目录与现有备份目标…".into()
+        } else {
+            "正在扫描本地整理目录并准备独立备份目标…".into()
+        };
+        let excluded = self.excluded_final_paths.clone();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.work_receiver = Some(receiver);
+        self.work_cancel = Some(cancel);
+        thread::spawn(move || {
+            let mut items = Vec::<RoutedFile>::new();
+            let mut error = None;
+            let mut excluded_count = 0usize;
+            for mapping in mappings {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    let _ = sender.send(WorkMessage::BackupComplete {
+                        copies: Vec::new(),
+                        verification: Vec::new(),
+                        cancelled: true,
+                        error,
+                        verify_only,
+                    });
+                    return;
+                }
+                let Some(source) = mapping.source else {
+                    continue;
+                };
+                let summary =
+                    match scan_sources(std::slice::from_ref(&source), &worker_cancel, |_| {}) {
+                        Ok(summary) => summary,
+                        Err(_) => {
+                            let _ = sender.send(WorkMessage::BackupComplete {
+                                copies: Vec::new(),
+                                verification: Vec::new(),
+                                cancelled: true,
+                                error,
+                                verify_only,
+                            });
+                            return;
+                        }
+                    };
+                if summary.error_count > 0 {
+                    error = Some(format!(
+                        "扫描 {} 时有 {} 项读取错误（例如 {}）",
+                        source.display(),
+                        summary.error_count,
+                        summary
+                            .error_samples
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("未提供")
+                    ));
+                }
+                for file in summary.files {
+                    if excluded.contains(&file.path) {
+                        excluded_count += mapping.targets.len();
+                        continue;
+                    }
+                    for target in &mapping.targets {
+                        items.push(RoutedFile {
+                            source: file.path.clone(),
+                            destination: target.join(&file.relative_path),
+                            expected_source: FileStamp {
+                                size: file.size,
+                                modified: file.modified,
+                            },
+                        });
+                    }
+                }
+            }
+            if items.is_empty() {
+                let _ = sender.send(WorkMessage::BackupComplete {
+                    copies: Vec::new(),
+                    verification: Vec::new(),
+                    cancelled: false,
+                    error: Some(match error {
+                        Some(error) => format!("{error}；没有可备份文件。"),
+                        None => "没有可备份文件；请检查来源目录和阶段⑥排除标记。".into(),
+                    }),
+                    verify_only,
+                });
+                return;
+            }
+            if excluded_count > 0 {
+                error = Some(match error {
+                    Some(error) => {
+                        format!("{error}；按阶段⑥决定排除了 {excluded_count} 个目标文件项。")
+                    }
+                    None => format!("按阶段⑥决定排除了 {excluded_count} 个目标文件项。"),
+                });
+            }
+            let item_count = items.len();
+            if verify_only {
+                let pairs = items
+                    .into_iter()
+                    .map(|item| (item.source, item.destination))
+                    .collect::<Vec<_>>();
+                let (verification, cancelled) =
+                    pipeline::verify_batch(pairs, &worker_cancel, |completed, total| {
+                        let _ = sender.send(WorkMessage::BackupProgress {
+                            completed,
+                            total,
+                            bytes: 0,
+                        });
+                    });
+                let _ = sender.send(WorkMessage::BackupComplete {
+                    copies: Vec::new(),
+                    verification,
+                    cancelled,
+                    error,
+                    verify_only,
+                });
+                return;
+            }
+            let (copies, cancelled_copy) =
+                pipeline::copy_batch(items, &worker_cancel, |completed, total, bytes| {
+                    let _ = sender.send(WorkMessage::BackupProgress {
+                        completed,
+                        total: total.saturating_mul(2),
+                        bytes,
+                    });
+                });
+            let pairs = copies
+                .iter()
+                .filter(|item| item.result.is_ok())
+                .map(|item| (item.source.clone(), item.destination.clone()))
+                .collect::<Vec<_>>();
+            let verify_total = item_count.saturating_mul(2);
+            let (verification, cancelled_verify) =
+                pipeline::verify_batch(pairs, &worker_cancel, |completed, _| {
+                    let _ = sender.send(WorkMessage::BackupProgress {
+                        completed: item_count.saturating_add(completed),
+                        total: verify_total,
+                        bytes: 0,
+                    });
+                });
+            let _ = sender.send(WorkMessage::BackupComplete {
+                copies,
+                verification,
+                cancelled: cancelled_copy || cancelled_verify,
+                error,
+                verify_only,
+            });
+        });
+    }
+
+    fn start_duplicate_scan(&mut self) {
+        if self.work_running {
+            return;
+        }
+        let Some(root) = self.duplicate_directory.clone() else {
+            self.status = "请先选择待检查目录。".into();
+            return;
+        };
+        self.duplicate_report = None;
+        self.excluded_final_paths.clear();
+        self.work_completed = 0;
+        self.work_total = 0;
+        self.work_bytes = 0;
+        self.work_kind = Some(WorkKind::Duplicates);
+        self.work_running = true;
+        self.status = "正在重新扫描目录并读取拍摄元数据…".into();
+        let threshold = self.duplicate_options.time_threshold_seconds;
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.work_receiver = Some(receiver);
+        self.work_cancel = Some(cancel);
+        thread::spawn(move || {
+            let summary = match scan_sources(&[root], &worker_cancel, |progress| {
+                let _ = sender.send(WorkMessage::DuplicateProgress {
+                    completed: progress.files,
+                    total: progress.files,
+                });
+            }) {
+                Ok(summary) => summary,
+                Err(_) => {
+                    let _ = sender.send(WorkMessage::DuplicateComplete {
+                        report: duplicates::DuplicateReport::default(),
+                        cancelled: true,
+                        error: None,
+                    });
+                    return;
+                }
+            };
+            if worker_cancel.load(Ordering::Relaxed) {
+                let _ = sender.send(WorkMessage::DuplicateComplete {
+                    report: duplicates::DuplicateReport::default(),
+                    cancelled: true,
+                    error: None,
+                });
+                return;
+            }
+            let paths = summary
+                .files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>();
+            let mut error = (summary.error_count > 0)
+                .then(|| format!("目录扫描有 {} 项无法读取。", summary.error_count));
+            let _ = sender.send(WorkMessage::DuplicateProgress {
+                completed: 0,
+                total: paths.len(),
+            });
+            let metadata =
+                match metadata::inspect_files(&paths, &worker_cancel, |completed, total| {
+                    let _ = sender.send(WorkMessage::DuplicateProgress { completed, total });
+                }) {
+                    Ok((records, cancelled)) => {
+                        if cancelled {
+                            let _ = sender.send(WorkMessage::DuplicateComplete {
+                                report: duplicates::DuplicateReport::default(),
+                                cancelled: true,
+                                error,
+                            });
+                            return;
+                        }
+                        records
+                    }
+                    Err(metadata_error) => {
+                        error = Some(match error {
+                            Some(scan_error) => {
+                                format!("{scan_error} 元数据不可用：{metadata_error}")
+                            }
+                            None => format!("拍摄时间不可用：{metadata_error}"),
+                        });
+                        paths
+                            .iter()
+                            .cloned()
+                            .map(|path| MetadataRecord::unsupported(path, metadata_error.clone()))
+                            .collect()
+                    }
+                };
+            let (report, cancelled) =
+                duplicates::analyze(&metadata, threshold, &worker_cancel, |completed, total| {
+                    let _ = sender.send(WorkMessage::DuplicateProgress { completed, total });
+                });
+            let _ = sender.send(WorkMessage::DuplicateComplete {
+                report,
+                cancelled,
+                error,
+            });
+        });
+    }
+
     fn start_metadata_for_copies(&mut self) {
         let paths: Vec<PathBuf> = self
             .copy_results
@@ -1396,6 +2118,104 @@ impl PhotoArchiveApp {
                     }
                     break;
                 }
+                Ok(WorkMessage::DuplicateProgress { completed, total }) => {
+                    self.work_completed = completed;
+                    self.work_total = total;
+                }
+                Ok(WorkMessage::DuplicateComplete {
+                    report,
+                    cancelled,
+                    error,
+                }) => {
+                    self.work_running = false;
+                    self.work_kind = None;
+                    self.work_receiver = None;
+                    self.work_cancel = None;
+                    let exact_groups = report.exact_groups.len();
+                    let candidates = report.time_candidates.len();
+                    let hash_errors = report.hash_errors.len();
+                    self.duplicate_report = Some(report);
+                    if cancelled {
+                        self.status = "重复检查已取消；未完成的文件需重新扫描。".into();
+                        self.apply_pending_stage();
+                    } else {
+                        let warning = error.unwrap_or_default();
+                        self.status = format!(
+                            "重复检查完成：{} 个精确重复组，{} 个时间候选，{} 个 SHA-256 读取错误。{}",
+                            exact_groups, candidates, hash_errors, warning
+                        );
+                        self.handoff_title = "重复检查已完成".into();
+                        self.handoff_description = format!(
+                            "本轮重新扫描并检查了目录。发现 {} 个字节完全相同组、{} 个时间候选、{} 个 SHA-256 读取错误。当前人工排除标记共 {} 项；只影响本次会话，不会删除磁盘文件。{}",
+                            exact_groups,
+                            candidates,
+                            hash_errors,
+                            self.excluded_final_paths.len(),
+                            warning
+                        );
+                        self.show_handoff = !self.apply_pending_stage();
+                    }
+                    break;
+                }
+                Ok(WorkMessage::BackupProgress {
+                    completed,
+                    total,
+                    bytes,
+                }) => {
+                    self.work_completed = completed;
+                    self.work_total = total;
+                    self.work_bytes = bytes;
+                }
+                Ok(WorkMessage::BackupComplete {
+                    copies,
+                    verification,
+                    cancelled,
+                    error,
+                    verify_only,
+                }) => {
+                    self.work_running = false;
+                    self.work_kind = None;
+                    self.work_receiver = None;
+                    self.work_cancel = None;
+                    let copied = copies.iter().filter(|item| item.result.is_ok()).count();
+                    let copy_failed = copies.len().saturating_sub(copied);
+                    let verified = verification
+                        .iter()
+                        .filter(|item| item.result.as_ref().is_ok_and(|result| result.matches))
+                        .count();
+                    let verify_failed = verification.len().saturating_sub(verified);
+                    if !verify_only {
+                        self.backup_copies = copies;
+                    }
+                    self.backup_verification = verification;
+                    let warning = error.unwrap_or_default();
+                    if cancelled {
+                        self.status = format!(
+                            "备份已取消：复制成功 {copied} 项、失败 {copy_failed} 项；读回校验 PASS {verified} 项、FAIL {verify_failed} 项。未完成项需重新扫描。{warning}"
+                        );
+                        self.apply_pending_stage();
+                    } else if verify_only {
+                        self.status = format!(
+                            "备份重新检查完成：PASS {verified} 项，FAIL {verify_failed} 项。{warning}"
+                        );
+                        self.handoff_title = "备份重新检查已完成".into();
+                        self.handoff_description = format!(
+                            "已重新扫描所选本地目录和目标，并重新读取 {} 项源/目标 SHA-256。PASS {verified} 项、FAIL {verify_failed} 项。{warning}",
+                            self.backup_verification.len()
+                        );
+                        self.show_handoff = !self.apply_pending_stage();
+                    } else {
+                        self.status = format!(
+                            "备份完成：复制成功 {copied} 项、失败 {copy_failed} 项；独立读回校验 PASS {verified} 项、FAIL {verify_failed} 项。{warning}"
+                        );
+                        self.handoff_title = "文件备份已完成".into();
+                        self.handoff_description = format!(
+                            "各所选备份目标分别执行了复制和逐文件 SHA-256 读回验证：复制成功 {copied} 项、失败 {copy_failed} 项；校验 PASS {verified} 项、FAIL {verify_failed} 项。结果按目标路径保留在本次会话内存中。{warning}"
+                        );
+                        self.show_handoff = !self.apply_pending_stage();
+                    }
+                    break;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.work_running = false;
@@ -1416,8 +2236,8 @@ impl PhotoArchiveApp {
         ui.add_space(8.0);
         ui.label(match self.stage {
             4 => "后续将接入离线 ExifTool，并支持本阶段独立选择目录。",
-            5 => "后续将实现 SHA-256、拍摄时间候选和离线 pHash。",
-            6 => "后续将实现每个来源文件夹到多个备份目录的独立验证。",
+            5 => "重复扫描、SHA-256、可信时间候选和受支持格式 pHash 已接入；图片预览、HEIC/RAW 全格式解码与 Final Manifest 联动仍未完成。",
+            6 => "按来源文件夹配置多个备份目标、独立复制并逐文件 SHA-256 读回校验已接入；断点恢复和暂停尚未实现。",
             7 => "后续将接入加密 7z、文件名加密、分卷和完整性测试。",
             _ => "",
         });
@@ -1462,6 +2282,15 @@ impl PhotoArchiveApp {
                     Some(WorkKind::Metadata) => format!(
                         "读取元数据 {} / {} 项",
                         self.work_completed, self.work_total
+                    ),
+                    Some(WorkKind::Duplicates) => {
+                        format!("重复检查 {} / {} 项", self.work_completed, self.work_total)
+                    }
+                    Some(WorkKind::Backup) => format!(
+                        "复制并校验 {} / {} 项，已写入 {}",
+                        self.work_completed,
+                        self.work_total,
+                        format_bytes(self.work_bytes)
                     ),
                     None => "准备阶段任务…".into(),
                 };
@@ -1648,6 +2477,11 @@ impl PhotoArchiveApp {
                 self.direct_verify_target = None;
                 self.metadata_directory = None;
                 self.metadata_results.clear();
+                self.duplicate_report = None;
+                self.excluded_final_paths.clear();
+                self.backup_mappings.clear();
+                self.backup_copies.clear();
+                self.backup_verification.clear();
                 self.status = "未携带来源清单；下一阶段需重新选择输入。".into();
                 self.stage = (self.stage + 1).min(STAGES.len() - 1);
             }
@@ -1727,6 +2561,73 @@ fn insert_source_root(roots: &mut Vec<SourceRoot>, path: PathBuf) -> Result<bool
     roots.push(SourceRoot { path: canonical });
     roots.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(true)
+}
+
+fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
+    let mut errors = std::collections::BTreeSet::new();
+    let sources = mappings
+        .iter()
+        .filter_map(|mapping| mapping.source.as_ref())
+        .collect::<Vec<_>>();
+    let targets = mappings
+        .iter()
+        .flat_map(|mapping| mapping.targets.iter())
+        .collect::<Vec<_>>();
+
+    for mapping in mappings {
+        let Some(source) = &mapping.source else {
+            errors.insert("有一行尚未选择本地来源文件夹".to_string());
+            continue;
+        };
+        if !source.is_dir() {
+            errors.insert(format!("来源目录不存在或不可访问：{}", source.display()));
+        }
+        if mapping.targets.is_empty() {
+            errors.insert(format!("{} 尚无备份目标", source.display()));
+        }
+        for target in &mapping.targets {
+            if !target.is_dir() {
+                errors.insert(format!("备份目标不存在或不可访问：{}", target.display()));
+            }
+            if source == target {
+                errors.insert(format!("{} 与目标相同，没有独立备份副本", source.display()));
+            }
+        }
+    }
+
+    for (index, first) in sources.iter().enumerate() {
+        for second in sources.iter().skip(index + 1) {
+            if first.starts_with(second) || second.starts_with(first) {
+                errors.insert(format!(
+                    "来源目录互相包含，会重复纳入文件：{} 与 {}",
+                    first.display(),
+                    second.display()
+                ));
+            }
+        }
+        for target in &targets {
+            if first.starts_with(target) || target.starts_with(first) {
+                errors.insert(format!(
+                    "来源与备份目标互相重叠：{} 与 {}；为避免递归或把备份当来源，请选择不重叠的目录",
+                    first.display(),
+                    target.display()
+                ));
+            }
+        }
+    }
+
+    for (index, first) in targets.iter().enumerate() {
+        for second in targets.iter().skip(index + 1) {
+            if first != second && (first.starts_with(second) || second.starts_with(first)) {
+                errors.insert(format!(
+                    "备份目标互相包含：{} 与 {}；请选择互不嵌套的目标目录",
+                    first.display(),
+                    second.display()
+                ));
+            }
+        }
+    }
+    errors.into_iter().collect()
 }
 
 fn scan_sources(
@@ -1966,6 +2867,79 @@ mod tests {
         assert_eq!(roots[0].path, fs::canonicalize(&parent).unwrap());
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn backup_target_overlap_is_blocked_but_multiple_disjoint_targets_are_valid() {
+        let root = temp_dir();
+        let source = root.join("Library/RAW");
+        let target_one = root.join("BackupA/RAW");
+        let target_two = root.join("BackupB/RAW");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target_one).unwrap();
+        fs::create_dir_all(&target_two).unwrap();
+
+        let valid = [BackupMapping {
+            source: Some(source.clone()),
+            targets: vec![target_one, target_two],
+        }];
+        assert!(backup_mapping_errors(&valid).is_empty());
+
+        let overlapping = [BackupMapping {
+            source: Some(source.clone()),
+            targets: vec![source.join("backup")],
+        }];
+        assert!(!backup_mapping_errors(&overlapping).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backup_revalidates_each_independent_destination() {
+        let root = temp_dir();
+        let source = root.join("Library/Photos");
+        let target_one = root.join("BackupA/Photos");
+        let target_two = root.join("BackupB/Photos");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target_one).unwrap();
+        fs::create_dir_all(&target_two).unwrap();
+        fs::write(source.join("IMG-中文.JPG"), b"photo bytes").unwrap();
+        let summary = scan_sources(&[source.clone()], &AtomicBool::new(false), |_| {}).unwrap();
+        let items = summary
+            .files
+            .iter()
+            .flat_map(|file| {
+                [&target_one, &target_two]
+                    .into_iter()
+                    .map(|target| RoutedFile {
+                        source: file.path.clone(),
+                        destination: target.join(&file.relative_path),
+                        expected_source: FileStamp {
+                            size: file.size,
+                            modified: file.modified,
+                        },
+                    })
+            })
+            .collect();
+        let (copies, cancelled) =
+            pipeline::copy_batch(items, &AtomicBool::new(false), |_, _, _| {});
+        assert!(!cancelled);
+        assert_eq!(copies.len(), 2);
+        assert!(copies.iter().all(|item| item.result.is_ok()));
+        let pairs = copies
+            .iter()
+            .map(|item| (item.source.clone(), item.destination.clone()))
+            .collect();
+        let (verification, cancelled) =
+            pipeline::verify_batch(pairs, &AtomicBool::new(false), |_, _| {});
+        assert!(!cancelled);
+        assert_eq!(verification.len(), 2);
+        assert!(
+            verification
+                .iter()
+                .all(|item| item.result.as_ref().is_ok_and(|result| result.matches))
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
 

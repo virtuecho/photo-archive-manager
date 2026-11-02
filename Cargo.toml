@@ -7,6 +7,7 @@ description = "Offline photo organization, verification, backup, and archive des
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "system_fonts"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 rfd = "0.17"
 serde_json = "1"
 sha2 = "0.11"

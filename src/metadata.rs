@@ -65,6 +65,33 @@ pub struct MetadataRecord {
 }
 
 impl MetadataRecord {
+    pub fn unsupported(path: PathBuf, reason: impl Into<String>) -> Self {
+        Self {
+            path,
+            file_type: None,
+            gps_status: MetadataStatus::Unsupported,
+            latitude: None,
+            longitude: None,
+            gps_source: None,
+            gps_zero_zero: false,
+            time_status: MetadataStatus::Unsupported,
+            capture_raw: None,
+            capture_normalized: None,
+            capture_precision: None,
+            capture_has_timezone: false,
+            capture_source: None,
+            capture_confidence: None,
+            make: None,
+            model: None,
+            lens: None,
+            focal_length: None,
+            exposure_time: None,
+            iso: None,
+            altitude: None,
+            error: Some(reason.into()),
+        }
+    }
+
     fn read_error(path: PathBuf, error: impl Into<String>) -> Self {
         Self {
             path,
@@ -714,6 +741,82 @@ fn normalize_datetime(raw: &str, offset_tag: Option<&str>) -> Option<(String, St
     Some((normalized, precision, timezone.is_some()))
 }
 
+pub fn capture_epoch_millis(record: &MetadataRecord) -> Option<i64> {
+    if record.time_status != MetadataStatus::Valid || !record.capture_has_timezone {
+        return None;
+    }
+    let normalized = record.capture_normalized.as_deref()?;
+    let (date, time_and_zone) = normalized.split_once('T')?;
+    let (time, zone) = split_timezone(time_and_zone);
+    let zone = zone?;
+    let offset_minutes = if zone.eq_ignore_ascii_case("Z") {
+        0
+    } else {
+        let sign = if zone.starts_with('-') { -1i64 } else { 1i64 };
+        let digits = zone.get(1..)?.replace(':', "");
+        if digits.len() != 4 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let hours = digits[..2].parse::<i64>().ok()?;
+        let minutes = digits[2..].parse::<i64>().ok()?;
+        if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
+            return None;
+        }
+        sign * (hours * 60 + minutes)
+    };
+
+    if !date.is_ascii()
+        || date.len() != 10
+        || date.as_bytes()[4] != b'-'
+        || date.as_bytes()[7] != b'-'
+    {
+        return None;
+    }
+    let year = date[0..4].parse::<i64>().ok()?;
+    let month = date[5..7].parse::<i64>().ok()?;
+    let day = date[8..10].parse::<i64>().ok()?;
+    if day <= 0 || day > i64::from(days_in_month(year as u32, month as u32)?) {
+        return None;
+    }
+
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, Some(fraction)),
+        None => (time, None),
+    };
+    let mut parts = clock.split(':');
+    let hour = parts.next()?.parse::<i64>().ok()?;
+    let minute = parts.next()?.parse::<i64>().ok()?;
+    let second = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let fraction = fraction.unwrap_or("");
+    if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let milliseconds = match fraction.len() {
+        0 => 0,
+        1 => fraction.parse::<i64>().ok()? * 100,
+        2 => fraction.parse::<i64>().ok()? * 10,
+        _ => fraction[..3].parse::<i64>().ok()?,
+    };
+    let days = days_from_civil(year, month, day);
+    Some(
+        (days * 86_400 + hour * 3_600 + minute * 60 + second - offset_minutes * 60) * 1000
+            + milliseconds,
+    )
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_from_march = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_from_march + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 fn split_timezone(value: &str) -> (&str, Option<&str>) {
     if let Some(index) = value.find(['+', '-']).filter(|index| *index >= 8) {
         return (&value[..index], Some(&value[index..]));
@@ -859,6 +962,24 @@ mod tests {
         );
         assert!(normalize_datetime("2023:02:29 12:00:00", None).is_none());
         assert!(normalize_datetime("2024:01:01 12:00:00", Some("+15:00")).is_none());
+    }
+
+    #[test]
+    fn capture_time_utc_key_respects_offsets_and_requires_a_timezone() {
+        let timed = |value: &str, has_timezone: bool| {
+            let mut record = MetadataRecord::read_error(PathBuf::from("sample.jpg"), "test");
+            record.time_status = MetadataStatus::Valid;
+            record.capture_normalized = Some(value.into());
+            record.capture_has_timezone = has_timezone;
+            record
+        };
+        let utc = timed("2018-02-21T12:08:56.21+00:00", true);
+        let offset = timed("2018-02-21T20:08:56.210+08:00", true);
+        assert_eq!(capture_epoch_millis(&utc), capture_epoch_millis(&offset));
+        assert_eq!(
+            capture_epoch_millis(&timed("2018-02-21T12:08:56", false)),
+            None
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
