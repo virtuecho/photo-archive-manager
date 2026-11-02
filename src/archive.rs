@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -17,6 +17,7 @@ use crate::{files, scan_sources, task_control::TaskControl};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
+static NEXT_RESTORE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct ArchiveResult {
@@ -25,6 +26,7 @@ pub struct ArchiveResult {
     pub file_count: usize,
     pub total_bytes: u64,
     pub archive_bytes: u64,
+    pub strict_restore_verified: bool,
     pub cleanup_warning: Option<String>,
 }
 
@@ -44,6 +46,63 @@ struct ExpectedEntry {
 }
 
 struct RemoveOnDrop(Vec<PathBuf>);
+
+struct TemporaryRestore(Option<PathBuf>);
+
+impl TemporaryRestore {
+    fn create() -> io::Result<Self> {
+        let base = std::env::temp_dir();
+        loop {
+            let suffix = NEXT_RESTORE.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!(
+                "photo-archive-restore-{}-{suffix}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(error) =
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                        {
+                            let _ = fs::remove_dir(&path);
+                            return Err(error);
+                        }
+                    }
+                    return Ok(Self(Some(path)));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("restore directory is active")
+    }
+
+    fn remove_now(&mut self) -> io::Result<()> {
+        let Some(path) = self.0.take() else {
+            return Ok(());
+        };
+        match fs::remove_dir_all(&path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.0 = Some(path);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for TemporaryRestore {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
 
 impl RemoveOnDrop {
     fn track(&mut self, path: PathBuf) {
@@ -160,12 +219,39 @@ impl Seek for VolumeReader {
     }
 }
 
+#[cfg(test)]
 pub fn create_and_verify(
     source: &Path,
     output_directory: &Path,
     archive_name: &str,
     password: &str,
     max_bytes: u64,
+    excluded_paths: &BTreeSet<PathBuf>,
+    included_sha256: Option<&BTreeMap<PathBuf, String>>,
+    control: &TaskControl,
+    progress: impl FnMut(usize, usize, u64),
+) -> Result<ArchiveResult, String> {
+    create_and_verify_with_restore(
+        source,
+        output_directory,
+        archive_name,
+        password,
+        max_bytes,
+        false,
+        excluded_paths,
+        included_sha256,
+        control,
+        progress,
+    )
+}
+
+pub fn create_and_verify_with_restore(
+    source: &Path,
+    output_directory: &Path,
+    archive_name: &str,
+    password: &str,
+    max_bytes: u64,
+    strict_restore: bool,
     excluded_paths: &BTreeSet<PathBuf>,
     included_sha256: Option<&BTreeMap<PathBuf, String>>,
     control: &TaskControl,
@@ -494,14 +580,27 @@ pub fn create_and_verify(
             .map(|metadata| sum.saturating_add(metadata.len()))
             .map_err(|error| format!("无法读取临时归档卷 {}：{error}", path.display()))
     })?;
+    let mut restore = strict_restore
+        .then(TemporaryRestore::create)
+        .transpose()
+        .map_err(|error| format!("无法创建隔离还原目录：{error}"))?;
     verify_archive_volumes(
         &staged_volumes,
         password,
         &expected,
         files.len(),
+        restore.as_ref().map(TemporaryRestore::path),
         control,
         &mut progress,
     )?;
+    if let Some(restore) = &mut restore {
+        if let Err(error) = restore.remove_now() {
+            return Err(format!(
+                "归档已验证，但无法清理隔离还原目录 {}：{error}",
+                restore.path().display()
+            ));
+        }
+    }
     if !control.checkpoint() {
         return Err("归档验证期间已取消；临时归档已清理。".into());
     }
@@ -552,6 +651,7 @@ pub fn create_and_verify(
         file_count: files.len(),
         total_bytes,
         archive_bytes,
+        strict_restore_verified: strict_restore,
         cleanup_warning,
     })
 }
@@ -575,6 +675,32 @@ fn archive_entry_name(top_name: &str, relative: &Path) -> Result<String, String>
         return Err("来源文件的相对路径为空。".into());
     }
     Ok(format!("{top_name}/{}", components.join("/")))
+}
+
+fn restore_path(root: &Path, archive_name: &str) -> io::Result<PathBuf> {
+    if archive_name.contains(['\\', '\0']) || (cfg!(windows) && archive_name.contains(':')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "归档还原路径含有不安全字符",
+        ));
+    }
+    let mut path = root.to_path_buf();
+    for component in archive_name.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "归档还原路径含有不安全路径段",
+            ));
+        }
+        path.push(component);
+    }
+    if !path.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "归档还原路径越出隔离目录",
+        ));
+    }
+    Ok(path)
 }
 
 fn archive_directory_names(
@@ -701,12 +827,21 @@ fn verify_archive_volumes(
     password: &str,
     expected: &BTreeMap<String, ExpectedEntry>,
     file_count: usize,
+    restore_root: Option<&Path>,
     control: &TaskControl,
     progress: &mut impl FnMut(usize, usize, u64),
 ) -> Result<(), String> {
     let source =
         VolumeReader::open(paths).map_err(|error| format!("无法打开完整归档卷序列：{error}"))?;
-    verify_archive_reader(source, password, expected, file_count, control, progress)
+    verify_archive_reader(
+        source,
+        password,
+        expected,
+        file_count,
+        restore_root,
+        control,
+        progress,
+    )
 }
 
 fn verify_archive_reader<R: Read + Seek>(
@@ -714,6 +849,7 @@ fn verify_archive_reader<R: Read + Seek>(
     password: &str,
     expected: &BTreeMap<String, ExpectedEntry>,
     file_count: usize,
+    restore_root: Option<&Path>,
     control: &TaskControl,
     progress: &mut impl FnMut(usize, usize, u64),
 ) -> Result<(), String> {
@@ -750,8 +886,25 @@ fn verify_archive_reader<R: Read + Seek>(
                 return Ok(true);
             }
             if expected_entry.directory {
+                if let Some(root) = restore_root {
+                    let path = restore_path(root, &name)?;
+                    fs::create_dir_all(&path)?;
+                }
                 return Ok(true);
             }
+            let mut restored_file = if let Some(root) = restore_root {
+                let path = restore_path(root, &name)?;
+                let parent = path.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "还原文件缺少父目录")
+                })?;
+                fs::create_dir_all(parent)?;
+                Some((
+                    path.clone(),
+                    OpenOptions::new().write(true).create_new(true).open(path)?,
+                ))
+            } else {
+                None
+            };
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; BUFFER_SIZE];
             let mut bytes = 0u64;
@@ -768,14 +921,31 @@ fn verify_archive_reader<R: Read + Seek>(
                     break;
                 }
                 hasher.update(&buffer[..count]);
+                if let Some((_, file)) = &mut restored_file {
+                    file.write_all(&buffer[..count])?;
+                }
                 bytes = bytes.saturating_add(count as u64);
             }
-            let digest = to_hex(&hasher.finalize());
-            if bytes != expected_entry.size || Some(digest) != expected_entry.sha256 {
+            let stream_digest = to_hex(&hasher.finalize());
+            if bytes != expected_entry.size || Some(stream_digest) != expected_entry.sha256 {
                 verification_errors.push(format!(
                     "归档内容与来源清单不符：{name}（预期 {} 字节）",
                     expected_entry.size
                 ));
+            }
+            if let Some((path, file)) = restored_file.take() {
+                file.sync_all()?;
+                drop(file);
+                let metadata = fs::metadata(&path)?;
+                let disk_digest = files::sha256_file(&path)?;
+                if metadata.len() != expected_entry.size
+                    || Some(disk_digest) != expected_entry.sha256
+                {
+                    verification_errors.push(format!(
+                        "隔离还原后的文件与来源清单不符：{}",
+                        path.display()
+                    ));
+                }
             }
             verified_files += 1;
             verified_bytes = verified_bytes.saturating_add(bytes);
@@ -851,6 +1021,58 @@ mod tests {
                 fs::copy(volume, volume_path(&destination, index + 1, true)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn strict_restore_checks_written_files_and_cleans_its_temporary_directory() {
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(source.join("nested/photo.jpg"), b"restored image bytes").unwrap();
+
+        let result = create_and_verify_with_restore(
+            &source,
+            &output,
+            "Photos.7z",
+            "pw",
+            2_000_000_000,
+            true,
+            &BTreeSet::new(),
+            None,
+            &TaskControl::default(),
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(result.strict_restore_verified);
+        assert_eq!(result.file_count, 1);
+        let prefix = format!("photo-archive-restore-{}-", std::process::id());
+        assert!(
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&prefix))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_restore_rejects_unsafe_archive_paths() {
+        let root = test_dir();
+        for name in [
+            "../escape",
+            "Photos/../../escape",
+            "/absolute",
+            "Photos\\escape",
+        ] {
+            assert!(restore_path(&root, name).is_err(), "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

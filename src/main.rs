@@ -205,6 +205,7 @@ impl Default for DuplicateOptions {
 #[derive(Clone, Copy)]
 struct ArchiveOptions {
     volume_mb: u32,
+    strict_restore: bool,
 }
 
 struct PreviewPixels {
@@ -243,7 +244,10 @@ impl FinalManifest {
 
 impl Default for ArchiveOptions {
     fn default() -> Self {
-        Self { volume_mb: 2000 }
+        Self {
+            volume_mb: 2000,
+            strict_restore: false,
+        }
     }
 }
 
@@ -1778,10 +1782,20 @@ impl PhotoArchiveApp {
                     .text("单卷上限（十进制 MB）"),
             )
             .changed();
+        archive_inputs_changed |= ui
+            .add_enabled(
+                !self.work_running,
+                eframe::egui::Checkbox::new(
+                    &mut self.archive_options.strict_restore,
+                    "执行隔离目录还原校验",
+                ),
+            )
+            .changed();
         if archive_inputs_changed {
             self.invalidate_pending_archive();
         }
         ui.weak("2000 MB = 2,000,000,000 字节。密码只用于当前归档任务；不会写入文件名、进程参数或报告。归档采用 Store（不压缩）、AES-256 和加密文件名。");
+        ui.weak("隔离还原校验会将归档内容写入权限受限的临时目录，再重读每个文件并核对 SHA-256；完成后清理，额外临时空间至少需要容纳一份还原内容。");
         if !self.excluded_final_paths.is_empty() {
             ui.weak(format!(
                 "携带了 {} 个阶段⑥排除标记；归档扫描遇到同一绝对路径时会从输入清单排除。",
@@ -1916,6 +1930,7 @@ impl PhotoArchiveApp {
             output_directory: output_directory.clone(),
             name: name.clone(),
             volume_mb: self.archive_options.volume_mb,
+            strict_restore: self.archive_options.strict_restore,
             manifest_fingerprint: self.archive_manifest_fingerprint(&source),
         };
         let was_resume = self.pending_archive_resume.is_some();
@@ -1925,6 +1940,7 @@ impl PhotoArchiveApp {
         }
         self.pending_archive_resume = Some(plan);
         let max_bytes = u64::from(self.archive_options.volume_mb) * 1_000_000;
+        let strict_restore = self.archive_options.strict_restore;
         let excluded_paths = self.excluded_final_paths.clone();
         let included_sha256 = self
             .final_manifest
@@ -1950,12 +1966,13 @@ impl PhotoArchiveApp {
         self.work_receiver = Some(receiver);
         self.work_control = Some(control);
         thread::spawn(move || {
-            let result = archive::create_and_verify(
+            let result = archive::create_and_verify_with_restore(
                 &source,
                 &output_directory,
                 &name,
                 &password,
                 max_bytes,
+                strict_restore,
                 &excluded_paths,
                 included_sha256.as_ref(),
                 &worker_control,
@@ -3101,7 +3118,12 @@ impl PhotoArchiveApp {
                                 Err(error) => format!("归档完成，但无法清理恢复记录：{error}。"),
                             };
                             self.status = format!(
-                                "归档完成并通过逐文件 SHA-256 还原流校验：{} 个文件，{} 卷，输入 {}，归档 {}。{}{}",
+                                "归档完成并通过{}：{} 个文件，{} 卷，输入 {}，归档 {}。{}{}",
+                                if result.strict_restore_verified {
+                                    "隔离目录还原与逐文件 SHA-256 重读"
+                                } else {
+                                    "流式解码与逐文件 SHA-256 校验"
+                                },
                                 result.file_count,
                                 result.volume_count,
                                 format_bytes(result.total_bytes),
@@ -3111,7 +3133,12 @@ impl PhotoArchiveApp {
                             );
                             self.handoff_title = "加密归档已完成".into();
                             self.handoff_description = format!(
-                                "已在临时目录完成归档清单和逐文件 SHA-256 读取校验，并防覆盖提交卷集：{}。验证文件 {} 项；输入 {}；总归档大小 {}。这套卷对应一个逻辑 7z 归档。{}{}",
+                                "已完成{}，并防覆盖提交卷集：{}。验证文件 {} 项；输入 {}；总归档大小 {}。这套卷对应一个逻辑 7z 归档。{}{}",
+                                if result.strict_restore_verified {
+                                    "隔离目录还原和逐文件 SHA-256 重读校验"
+                                } else {
+                                    "内存流式读取和逐文件 SHA-256 校验"
+                                },
                                 result
                                     .volume_paths
                                     .iter()
@@ -3445,6 +3472,7 @@ impl PhotoArchiveApp {
                 self.archive_name = plan.name.clone();
                 self.archive_name_custom = true;
                 self.archive_options.volume_mb = plan.volume_mb;
+                self.archive_options.strict_restore = plan.strict_restore;
                 if plan.manifest_fingerprint == self.archive_manifest_fingerprint(&plan.source) {
                     self.pending_archive_resume = Some(plan);
                     if self.pending_copy_resume.is_none() && self.pending_backup_resume.is_none() {

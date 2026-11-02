@@ -38,6 +38,8 @@ pub struct SavedArchivePlan {
     pub name: String,
     pub volume_mb: u32,
     #[serde(default)]
+    pub strict_restore: bool,
+    #[serde(default)]
     pub manifest_fingerprint: Option<String>,
 }
 
@@ -639,6 +641,7 @@ mod tests {
             output_directory: root.join("archives"),
             name: "Photos 2026_11_02".into(),
             volume_mb: 2_000,
+            strict_restore: true,
             manifest_fingerprint: None,
         }
     }
