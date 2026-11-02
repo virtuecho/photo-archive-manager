@@ -60,6 +60,9 @@ def main() -> None:
             report.write(path.read_text(encoding="utf-8", errors="replace"))
             report.write("\n")
 
+    normalized = "\n".join(line.rstrip() for line in REPORT.read_text(encoding="utf-8").splitlines())
+    REPORT.write_text(normalized + "\n", encoding="utf-8")
+
     print(f"Wrote {REPORT.relative_to(ROOT)} with {len(notices)} package notice files.")
 
 

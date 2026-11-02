@@ -13,6 +13,7 @@ mod archive;
 mod checkpoint;
 mod duplicates;
 pub mod files;
+mod image_formats;
 mod metadata;
 mod pipeline;
 mod task_control;
@@ -3762,6 +3763,7 @@ fn format_bytes(bytes: u64) -> String {
 fn decode_candidate_preview(path: &Path) -> Result<PreviewPixels, String> {
     use image::ImageDecoder;
 
+    image_formats::register_heif_decoder();
     let reader = image::ImageReader::open(path)
         .map_err(|error| format!("无法打开预览文件：{error}"))?
         .with_guessed_format()
@@ -3889,6 +3891,20 @@ mod tests {
         let (width, height) = preview.image.dimensions();
         assert_eq!(width, 640);
         assert!(height <= 640);
+
+        let heif_path = root.join("generated.heic");
+        let heif_pixels = (0..64 * 64)
+            .flat_map(|index| {
+                let value = (index % 256) as u8;
+                [value, value.wrapping_mul(2), 255 - value, 255]
+            })
+            .collect::<Vec<_>>();
+        let heif =
+            heifer::encode_rgba8(64, 64, &heif_pixels, &heifer::EncodeOptions::default()).unwrap();
+        fs::write(&heif_path, heif).unwrap();
+        let heif_preview = decode_candidate_preview(&heif_path).unwrap();
+        assert_eq!(heif_preview.image.dimensions(), (640, 640));
+        assert!(duplicates::perceptual_hash(&heif_path).is_ok());
 
         let unsupported = root.join("unsupported.bin");
         fs::write(&unsupported, b"not an image").unwrap();

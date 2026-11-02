@@ -247,6 +247,7 @@ fn devices_differ(first: &MetadataRecord, second: &MetadataRecord) -> bool {
 }
 
 pub fn perceptual_hash(path: &Path) -> Result<u64, String> {
+    crate::image_formats::register_heif_decoder();
     let reader = ImageReader::open(path).map_err(|error| error.to_string())?;
     let reader = reader
         .with_guessed_format()
