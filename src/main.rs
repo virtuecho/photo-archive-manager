@@ -8,6 +8,7 @@ use std::{
 };
 
 mod archive;
+mod checkpoint;
 mod duplicates;
 pub mod files;
 mod metadata;
@@ -252,6 +253,7 @@ struct PhotoArchiveApp {
     duplicate_report: Option<duplicates::DuplicateReport>,
     excluded_final_paths: std::collections::BTreeSet<PathBuf>,
     final_manifest: Option<FinalManifest>,
+    review_checkpoint_saved: bool,
     candidate_preview_paths: Option<(PathBuf, PathBuf)>,
     candidate_preview_receiver:
         Option<Receiver<(Result<PreviewPixels, String>, Result<PreviewPixels, String>)>>,
@@ -328,7 +330,7 @@ impl eframe::App for PhotoArchiveApp {
                             } else if self.stage == 7 {
                                 self.archive_stage(ui);
                             } else {
-                                self.incomplete_stage(ui);
+                                ui.label("未知阶段状态；请从底部导航重新选择阶段。");
                             }
                         });
                 },
@@ -1040,8 +1042,7 @@ impl PhotoArchiveApp {
                         Ok(path) => {
                             self.duplicate_directory = Some(path);
                             self.duplicate_report = None;
-                            self.excluded_final_paths.clear();
-                            self.final_manifest = None;
+                            self.clear_saved_review();
                             self.clear_candidate_preview();
                         }
                         Err(error) => {
@@ -1232,12 +1233,31 @@ impl PhotoArchiveApp {
                 self.excluded_final_paths.len()
             ));
         }
-        if let Some(manifest) = &self.final_manifest {
-            ui.weak(format!(
-                "已携带阶段⑥ Final Manifest：{} 个文件；与 {} 重叠的备份来源只处理这些已确认路径并核对 SHA-256。",
+        if let Some((count, root)) = self.final_manifest.as_ref().map(|manifest| {
+            (
                 manifest.file_sha256.len(),
-                manifest.root.display()
-            ));
+                manifest.root.display().to_string(),
+            )
+        }) {
+            let checkpoint_note = if self.review_checkpoint_saved {
+                "审核决定保存在本机私有检查点。"
+            } else {
+                "审核决定仅在当前运行中可用；检查点未保存。"
+            };
+            let mut clear_review = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!(
+                    "阶段⑥ Final Manifest：{} 个已确认文件；与 {} 重叠的备份来源只处理这些路径并核对 SHA-256。{}",
+                    count, root, checkpoint_note
+                ));
+                if ui.button("清除审核清单").clicked() {
+                    clear_review = true;
+                }
+            });
+            if clear_review {
+                self.clear_saved_review();
+                self.status = "已清除本机阶段⑥审核清单；后续备份将重新扫描所选目录。".into();
+            }
         }
         if ui
             .add_enabled(
@@ -1513,10 +1533,26 @@ impl PhotoArchiveApp {
         if let (Some(source), Some(manifest)) = (&self.archive_source, self.final_manifest.as_ref())
             && manifest.applies_to(source)
         {
-            ui.weak(format!(
-                "已携带阶段⑥ Final Manifest：只归档其中 {} 个已确认文件，并核对其 SHA-256。",
-                manifest.file_sha256.len()
-            ));
+            let count = manifest.file_sha256.len();
+            let checkpoint_note = if self.review_checkpoint_saved {
+                "审核决定保存在本机私有检查点。"
+            } else {
+                "审核决定仅在当前运行中可用；检查点未保存。"
+            };
+            let mut clear_review = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!(
+                    "阶段⑥ Final Manifest：只归档其中 {} 个已确认文件，并核对其 SHA-256；{}",
+                    count, checkpoint_note
+                ));
+                if ui.button("清除审核清单").clicked() {
+                    clear_review = true;
+                }
+            });
+            if clear_review {
+                self.clear_saved_review();
+                self.status = "已清除本机阶段⑥审核清单；归档将按所选目录重新建立输入清单。".into();
+            }
         }
         ui.horizontal(|ui| {
             ui.label("密码");
@@ -1903,8 +1939,7 @@ impl PhotoArchiveApp {
             return;
         };
         self.duplicate_report = None;
-        self.excluded_final_paths.clear();
-        self.final_manifest = None;
+        self.clear_saved_review();
         self.clear_candidate_preview();
         self.work_completed = 0;
         self.work_total = 0;
@@ -2592,7 +2627,7 @@ impl PhotoArchiveApp {
                         );
                         self.handoff_title = "重复检查已完成".into();
                         self.handoff_description = format!(
-                            "本轮重新扫描并检查了目录。发现 {} 个字节完全相同组、{} 个时间候选、{} 个 SHA-256 读取错误。携带时会将成功计算 SHA-256 且未排除的路径组成仅保存在本次会话内存中的 Final Manifest，阶段⑦/⑧对重叠来源只处理其中路径并复核哈希。当前人工排除标记共 {} 项；只影响本次会话，不会删除磁盘文件。{}",
+                            "本轮重新扫描并检查了目录。发现 {} 个字节完全相同组、{} 个时间候选、{} 个 SHA-256 读取错误。携带时会把成功计算 SHA-256 且未排除的路径组成 Final Manifest，并将路径、哈希和排除决定保存到本机私有检查点；重启后可恢复审核决定，阶段⑦/⑧仍会重新扫描并核对内容。当前人工排除标记共 {} 项；不会删除磁盘文件。{}",
                             exact_groups,
                             candidates,
                             hash_errors,
@@ -2724,20 +2759,6 @@ impl PhotoArchiveApp {
                 }
             }
         }
-    }
-
-    fn incomplete_stage(&self, ui: &mut eframe::egui::Ui) {
-        ui.label(
-            "此阶段尚未实现。底部导航可进入任意阶段；当前已接入来源扫描、扩展名路由、流式复制和逐项 SHA-256 校验。",
-        );
-        ui.add_space(8.0);
-        ui.label(match self.stage {
-            4 => "后续将接入离线 ExifTool，并支持本阶段独立选择目录。",
-            5 => "重复扫描、SHA-256、可信时间候选和受支持格式 pHash 已接入；图片预览、HEIC/RAW 全格式解码与 Final Manifest 联动仍未完成。",
-            6 => "按来源文件夹配置多个备份目标、独立复制并逐文件 SHA-256 读回校验已接入；断点恢复和暂停尚未实现。",
-            7 => "后续将接入加密 7z、文件名加密、分卷和完整性测试。",
-            _ => "",
-        });
     }
 
     fn footer(&mut self, ui: &mut eframe::egui::Ui, ctx: &eframe::egui::Context) {
@@ -2896,6 +2917,7 @@ impl PhotoArchiveApp {
 
     fn start_scan(&mut self) {
         let roots: Vec<PathBuf> = self.roots.iter().map(|root| root.path.clone()).collect();
+        self.clear_saved_review();
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -2943,6 +2965,61 @@ impl PhotoArchiveApp {
             }
         }
         self.routes.sort_by(|a, b| a.extension.cmp(&b.extension));
+    }
+
+    fn restore_saved_review(&mut self) {
+        match checkpoint::load() {
+            Ok(Some(saved)) => {
+                let count = saved.file_sha256.len();
+                let excluded = saved.excluded_paths.len();
+                self.final_manifest = Some(FinalManifest {
+                    root: saved.root,
+                    file_sha256: saved.file_sha256,
+                });
+                self.excluded_final_paths = saved.excluded_paths;
+                self.review_checkpoint_saved = true;
+                self.status = format!(
+                    "已从本机私有检查点恢复阶段⑥人工审核：{count} 个已确认文件、{excluded} 个排除决定。备份或归档前仍会重新读取并核对 SHA-256。"
+                );
+            }
+            Ok(None) => self.review_checkpoint_saved = false,
+            Err(error) => {
+                self.review_checkpoint_saved = false;
+                self.status = format!(
+                    "无法恢复上次阶段⑥检查点：{error}。请重新执行重复检查；现有文件未被修改。"
+                );
+            }
+        }
+    }
+
+    fn persist_saved_review(&mut self) {
+        let Some(manifest) = &self.final_manifest else {
+            self.clear_saved_review();
+            return;
+        };
+        let review = checkpoint::SavedReview {
+            root: manifest.root.clone(),
+            file_sha256: manifest.file_sha256.clone(),
+            excluded_paths: self.excluded_final_paths.clone(),
+        };
+        match checkpoint::save(&review) {
+            Ok(()) => self.review_checkpoint_saved = true,
+            Err(error) => {
+                self.review_checkpoint_saved = false;
+                self.status = format!(
+                    "阶段⑥审核在本次运行中已携带，但无法写入本机私有恢复检查点：{error}。应用退出后需要重新审核。"
+                );
+            }
+        }
+    }
+
+    fn clear_saved_review(&mut self) {
+        self.final_manifest = None;
+        self.review_checkpoint_saved = false;
+        self.excluded_final_paths.clear();
+        if let Err(error) = checkpoint::clear() {
+            self.status = format!("无法清除本机阶段⑥恢复检查点：{error}");
+        }
     }
 
     fn receive_scan_updates(&mut self) {
@@ -3034,6 +3111,7 @@ impl PhotoArchiveApp {
                         .map(|(path, sha256)| (path.clone(), sha256.clone()))
                         .collect();
                     self.final_manifest = Some(FinalManifest { root, file_sha256 });
+                    self.persist_saved_review();
                 }
                 self.stage = (self.stage + 1).min(STAGES.len() - 1);
             }
@@ -3049,8 +3127,7 @@ impl PhotoArchiveApp {
                 self.metadata_directory = None;
                 self.metadata_results.clear();
                 self.duplicate_report = None;
-                self.excluded_final_paths.clear();
-                self.final_manifest = None;
+                self.clear_saved_review();
                 self.backup_mappings.clear();
                 self.backup_copies.clear();
                 self.backup_verification.clear();
@@ -3544,7 +3621,9 @@ fn main() -> eframe::Result {
             creation_context
                 .egui_ctx
                 .set_visuals(eframe::egui::Visuals::light());
-            Ok(Box::new(PhotoArchiveApp::default()))
+            let mut app = PhotoArchiveApp::default();
+            app.restore_saved_review();
+            Ok(Box::new(app))
         }),
     )
 }

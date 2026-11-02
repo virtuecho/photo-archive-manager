@@ -25,9 +25,9 @@ cargo test --release archive::tests::archives_a_single_file_larger_than_the_defa
 ## 已知限制
 
 - ExifTool 仅有 macOS arm64 嵌入构建；Windows、macOS Intel 需补齐真正自包含的对应运行时。
-- 重复检查支持 JPEG/PNG pHash 与并排预览；当前会话携带阶段⑥结果后会生成内存 Final Manifest，备份/归档仅处理其确认路径并复核哈希。没有 HEIC/RAW 解码或持久/导出的 Final Manifest，排除决定只保存在当前会话。
+- 重复检查支持 JPEG/PNG pHash 与并排预览；携带阶段⑥结果后，Final Manifest 的路径、SHA-256 和排除决定会保存到本机私有检查点，启动时恢复；备份/归档会重新扫描并复核哈希。检查点只恢复审核决定，不恢复其他未完成阶段或 PASS 状态。没有 HEIC/RAW 解码或可导出的 Final Manifest。
 - 文件在阶段间被外部修改时，尚未实现完整的跨阶段自动失效与依赖重检联动。
-- 任务支持当前进程内在安全边界暂停/恢复；关闭程序后不会从检查点恢复。归档先写临时单文件再切卷，峰值临时空间可能接近最终归档体积的两倍；多卷最终提交遇到一般错误会回滚，但系统崩溃时多文件名无法作为一个原子事务提交。
+- 任务支持当前进程内在安全边界暂停/恢复；关闭程序后只有阶段⑥审核清单可恢复，其他处理中任务没有通用检查点。归档先写临时单文件再切卷，峰值临时空间可能接近最终归档体积的两倍；多卷最终提交遇到一般错误会回滚，但系统崩溃时多文件名无法作为一个原子事务提交。
 - 归档已在本机用官方 7-Zip 26.05 验证小卷互操作及 2,000,000,001 字节单文件的测试、提取和 SHA-256；未在 Windows、macOS Intel 或干净系统上做同等验收。程序内没有“恢复到隔离目录”的单独严格校验模式。
 - 程序擦除自己持有的密码字符串；`sevenz-rust2` 内部密码缓冲区不保证主动擦零。
 - Rust 锁定依赖图的许可证文本和 attribution 已由 cargo-about 生成并嵌入窗口；ExifTool/Perl/PAR payload 的全部打包模块 attribution 仍需单独核验。生成说明见 `resources/THIRD_PARTY_NOTICES.md`。
