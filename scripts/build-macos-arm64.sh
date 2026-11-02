@@ -15,9 +15,27 @@ if [[ "$host" != "aarch64-apple-darwin" ]]; then
     exit 1
 fi
 
-if [[ ! -f resources/exiftool/macos-aarch64/exiftool ]]; then
+payload="resources/exiftool/macos-aarch64/exiftool"
+expected_payload_sha256="224c4384d1df807c14f6ebcb04972ab5b918cac076b9dc4cebc99da981ed0b95"
+if [[ ! -f "$payload" ]]; then
     echo "Embedded ExifTool payload is missing: resources/exiftool/macos-aarch64/exiftool" >&2
     exit 1
+fi
+actual_payload_sha256="$(shasum -a 256 "$payload" | awk '{ print $1 }')"
+if [[ "$actual_payload_sha256" != "$expected_payload_sha256" ]]; then
+    echo "Embedded macOS arm64 ExifTool payload SHA-256 mismatch." >&2
+    exit 1
+fi
+
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+project_remap="--remap-path-prefix=$repo_root=."
+cargo_remap="--remap-path-prefix=$cargo_home=cargo"
+if [[ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+    export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"$project_remap"$'\x1f'"$cargo_remap"
+else
+    printf -v project_remap '%q' "$project_remap"
+    printf -v cargo_remap '%q' "$cargo_remap"
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$project_remap $cargo_remap"
 fi
 
 cargo fmt --all -- --check

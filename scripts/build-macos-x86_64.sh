@@ -22,6 +22,17 @@ if ! rustup target list --installed | rg -qx "$target"; then
     exit 1
 fi
 
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+project_remap="--remap-path-prefix=$repo_root=."
+cargo_remap="--remap-path-prefix=$cargo_home=cargo"
+if [[ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+    export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"$project_remap"$'\x1f'"$cargo_remap"
+else
+    printf -v project_remap '%q' "$project_remap"
+    printf -v cargo_remap '%q' "$cargo_remap"
+    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$project_remap $cargo_remap"
+fi
+
 cargo fmt --all -- --check
 cargo test --locked
 cargo build --locked --release --target "$target"

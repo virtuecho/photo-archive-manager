@@ -26,6 +26,10 @@ Windows x86_64 可在本机安装 Rust GNU target 与 MinGW-w64 后运行：
 
 输出文件为 `target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe`。本机生成的 PE32+ GUI 程序约 21 MB，嵌入官方 ExifTool 13.60 x64 ZIP；启动元数据检查时会在 `%LOCALAPPDATA%/PhotoArchiveManager/runtime` 下校验并释放 ExifTool、Perl 与 DLL，然后清理。构建脚本检查 GUI 子系统以及 PE 导入表中没有 MinGW runtime DLL。该产物仍需在 Windows 上实机启动与离线全流程验证。
 
+## 构建路径检查
+
+三个构建入口都会把仓库目录和 Cargo 缓存目录从 Rust 产物路径中重映射，。macOS ExifTool payload 的当前校验值见 [`resources/exiftool/THIRD_PARTY_NOTICES.md`](../resources/exiftool/THIRD_PARTY_NOTICES.md)；arm64 payload 使用注明的 ExifTool 与 PAR::Packer 源码重新打包，避免在已签名二进制上直接改写路径。
+
 超过默认单卷上限的大文件验收需显式运行，因为它会完整流式处理至少 2 GB：
 
 ```sh
