@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
@@ -11,6 +12,117 @@ pub struct SavedReview {
     pub root: PathBuf,
     pub file_sha256: BTreeMap<PathBuf, String>,
     pub excluded_paths: BTreeSet<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SavedCopyItem {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub expected_size: u64,
+    pub modified_before_epoch: bool,
+    pub modified_seconds: Option<u64>,
+    pub modified_nanos: Option<u32>,
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PendingCopyCheckpoint {
+    version: u8,
+    items: Vec<SavedCopyItem>,
+}
+
+pub fn save_pending_copy(items: &[SavedCopyItem]) -> io::Result<()> {
+    write_pending_copy_to(&pending_copy_path()?, items)
+}
+
+fn write_pending_copy_to(path: &Path, items: &[SavedCopyItem]) -> io::Result<()> {
+    validate_pending_copy(items)?;
+    write_json_atomically(
+        path,
+        &PendingCopyCheckpoint {
+            version: 1,
+            items: items.to_vec(),
+        },
+    )
+}
+
+pub fn load_pending_copy() -> io::Result<Option<Vec<SavedCopyItem>>> {
+    read_pending_copy_from(&pending_copy_path()?)
+}
+
+fn read_pending_copy_from(path: &Path) -> io::Result<Option<Vec<SavedCopyItem>>> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "复制任务检查点必须是普通文件",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let checkpoint: PendingCopyCheckpoint =
+        serde_json::from_slice(&data).map_err(io::Error::other)?;
+    if checkpoint.version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "不支持的复制任务检查点版本",
+        ));
+    }
+    validate_pending_copy(&checkpoint.items)?;
+    Ok(Some(checkpoint.items))
+}
+
+fn validate_pending_copy(items: &[SavedCopyItem]) -> io::Result<()> {
+    if items.is_empty() || items.len() > 1_000_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "复制任务文件数无效",
+        ));
+    }
+    let mut destinations = BTreeSet::new();
+    for item in items {
+        if !item.source.is_absolute()
+            || !item.destination.is_absolute()
+            || item.source == item.destination
+            || !destinations.insert(item.destination.clone())
+            || item
+                .modified_nanos
+                .is_some_and(|nanos| nanos >= 1_000_000_000)
+            || item.modified_seconds.is_some() != item.modified_nanos.is_some()
+            || item.expected_sha256.as_ref().is_some_and(|sha256| {
+                sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "复制任务路径、时间戳或 SHA-256 无效",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn clear_pending_copy() -> io::Result<()> {
+    match fs::remove_file(pending_copy_path()?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn save(review: &SavedReview) -> io::Result<()> {
@@ -32,6 +144,14 @@ pub fn clear() -> io::Result<()> {
 }
 
 fn checkpoint_path() -> io::Result<PathBuf> {
+    Ok(checkpoint_dir()?.join("task-checkpoint.json"))
+}
+
+fn pending_copy_path() -> io::Result<PathBuf> {
+    Ok(checkpoint_dir()?.join("unfinished-copy.json"))
+}
+
+fn checkpoint_dir() -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     let base = env::var_os("HOME")
         .map(PathBuf::from)
@@ -52,7 +172,7 @@ fn checkpoint_path() -> io::Result<PathBuf> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let base = env::var_os("HOME").map(PathBuf::from);
 
-    base.map(|path| path.join("PhotoArchiveManager/task-checkpoint.json"))
+    base.map(|path| path.join("PhotoArchiveManager"))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "应用私有数据目录不可用"))
 }
 
@@ -86,6 +206,19 @@ fn write_to(path: &Path, review: &SavedReview) -> io::Result<()> {
     }))
     .map_err(io::Error::other)?;
 
+    write_data_atomically(parent, path, &data)
+}
+
+fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "检查点路径没有父目录"))?;
+    create_private_dir(parent)?;
+    let data = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    write_data_atomically(parent, path, &data)
+}
+
+fn write_data_atomically(parent: &Path, path: &Path, data: &[u8]) -> io::Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let temp = parent.join(format!(
         ".task-checkpoint-{}-{}.tmp",
@@ -271,6 +404,18 @@ mod tests {
         }
     }
 
+    fn sample_copy_item(root: &Path) -> SavedCopyItem {
+        SavedCopyItem {
+            source: root.join("photo.jpg"),
+            destination: root.join("backup/photo.jpg"),
+            expected_size: 123,
+            modified_before_epoch: false,
+            modified_seconds: Some(1_700_000_000),
+            modified_nanos: Some(42),
+            expected_sha256: Some("a".repeat(64)),
+        }
+    }
+
     #[test]
     fn checkpoint_round_trips_review_and_exclusions() {
         let dir = temp_path();
@@ -310,6 +455,34 @@ mod tests {
         review.file_sha256 = BTreeMap::from([(PathBuf::from("/tmp/escape.jpg"), "b".repeat(64))]);
         assert_eq!(
             write_to(&path, &review).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_copy_checkpoint_round_trips_items() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-copy.json");
+        let items = vec![sample_copy_item(&dir)];
+        write_pending_copy_to(&path, &items).unwrap();
+        assert_eq!(read_pending_copy_from(&path).unwrap(), Some(items));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_copy_checkpoint_rejects_duplicate_destinations() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-copy.json");
+        let first = sample_copy_item(&dir);
+        let mut second = first.clone();
+        second.source = dir.join("other.jpg");
+        assert_eq!(
+            write_pending_copy_to(&path, &[first, second])
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
         fs::remove_dir_all(dir).unwrap();

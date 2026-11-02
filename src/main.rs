@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 mod archive;
@@ -273,6 +273,7 @@ struct PhotoArchiveApp {
     excluded_final_paths: std::collections::BTreeSet<PathBuf>,
     final_manifest: Option<FinalManifest>,
     review_checkpoint_saved: bool,
+    pending_copy_resume: Option<Vec<RoutedFile>>,
     candidate_preview_paths: Option<(PathBuf, PathBuf)>,
     candidate_preview_receiver:
         Option<Receiver<(Result<PreviewPixels, String>, Result<PreviewPixels, String>)>>,
@@ -667,7 +668,41 @@ impl PhotoArchiveApp {
     }
 
     fn copy_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("复制只写入所选目标目录，不修改来源；目标已有同名文件时会报错且不会覆盖。");
+        ui.label("复制只写入所选目标目录，不修改来源；新复制遇到已有目标会失败且不覆盖，恢复任务只会把重新校验一致的目标认作已完成。");
+        if self.last_scan.is_none() {
+            if let Some(items) = self.pending_copy_resume.as_ref() {
+                ui.add_space(8.0);
+                ui.label(format!(
+                    "发现上次未完成的文件复制：{} 项。恢复时会重新读取源与已有目标；不匹配的目标不会覆盖。",
+                    items.len()
+                ));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.work_running,
+                            eframe::egui::Button::new("恢复上次复制任务"),
+                        )
+                        .clicked()
+                    {
+                        self.resume_pending_copy();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.work_running,
+                            eframe::egui::Button::new("丢弃恢复记录"),
+                        )
+                        .clicked()
+                    {
+                        self.discard_pending_copy();
+                    }
+                });
+            } else {
+                ui.add_space(8.0);
+                ui.weak("此会话还没有来源清单。请先在①添加目录并扫描，然后返回本阶段。");
+            }
+            self.copy_results_ui(ui);
+            return;
+        }
         if ui
             .add_enabled(
                 !self.work_running,
@@ -725,7 +760,7 @@ impl PhotoArchiveApp {
                     .add_enabled(!blocked, eframe::egui::Button::new("开始安全复制"))
                     .clicked()
                 {
-                    self.start_copy(plan.items.clone(), false);
+                    self.start_copy(plan.items.clone(), false, false);
                 }
             }
             if !self.copy_results.is_empty()
@@ -739,7 +774,7 @@ impl PhotoArchiveApp {
                     )
                     .clicked()
             {
-                self.start_copy(retry_items.clone(), true);
+                self.start_copy(retry_items.clone(), true, false);
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Copy)
@@ -750,33 +785,38 @@ impl PhotoArchiveApp {
                 }
             }
         });
-        if !self.copy_results.is_empty() {
-            let passed = self
-                .copy_results
-                .iter()
-                .filter(|item| item.result.is_ok())
-                .count();
-            let failed = self.copy_results.len() - passed;
-            ui.separator();
-            ui.label(format!(
-                "复制结果：成功 {passed}，失败 {failed}，计划 {}。",
-                self.copy_planned
-            ));
-            for item in self.copy_results.iter().take(12) {
-                if let Err(error) = &item.result {
-                    ui.colored_label(
-                        eframe::egui::Color32::DARK_RED,
-                        format!(
-                            "{} → {}：{error}",
-                            item.source.display(),
-                            item.destination.display()
-                        ),
-                    );
-                }
+        self.copy_results_ui(ui);
+    }
+
+    fn copy_results_ui(&self, ui: &mut eframe::egui::Ui) {
+        if self.copy_results.is_empty() {
+            return;
+        }
+        let passed = self
+            .copy_results
+            .iter()
+            .filter(|item| item.result.is_ok())
+            .count();
+        let failed = self.copy_results.len() - passed;
+        ui.separator();
+        ui.label(format!(
+            "复制结果：成功 {passed}，失败 {failed}，计划 {}。",
+            self.copy_planned
+        ));
+        for item in self.copy_results.iter().take(12) {
+            if let Err(error) = &item.result {
+                ui.colored_label(
+                    eframe::egui::Color32::DARK_RED,
+                    format!(
+                        "{} → {}：{error}",
+                        item.source.display(),
+                        item.destination.display()
+                    ),
+                );
             }
-            if self.copy_results.len() > 12 {
-                ui.weak(format!("另有 {} 项未展开。", self.copy_results.len() - 12));
-            }
+        }
+        if self.copy_results.len() > 12 {
+            ui.weak(format!("另有 {} 项未展开。", self.copy_results.len() - 12));
         }
     }
 
@@ -1181,7 +1221,7 @@ impl PhotoArchiveApp {
             self.clear_saved_review();
             self.status = "重复检查阈值已更改；请重新扫描后再携带审核结果。".into();
         }
-        ui.weak("时区未知的拍摄时间不会参与跨文件比较。视频仍参与 SHA-256 和时间候选，但不计算静态照片 pHash。当前离线解码器仅支持 JPEG/PNG，其余格式会显示原因。");
+        ui.weak("时区未知的拍摄时间不会参与跨文件比较。视频仍参与 SHA-256 和时间候选，但不计算静态照片 pHash。离线预览和 pHash 支持 JPEG、PNG、HEIC、HEIF；RAW 或解码失败的格式会显示原因。");
         if !self.status.is_empty() {
             ui.label(&self.status);
         }
@@ -2435,8 +2475,18 @@ impl PhotoArchiveApp {
         plan
     }
 
-    fn start_copy(&mut self, items: Vec<RoutedFile>, preserve_existing: bool) {
+    fn start_copy(
+        &mut self,
+        items: Vec<RoutedFile>,
+        preserve_existing: bool,
+        resume_existing: bool,
+    ) {
         if items.is_empty() || self.work_running {
+            return;
+        }
+        let saved_items = items.iter().map(saved_copy_item).collect::<Vec<_>>();
+        if let Err(error) = checkpoint::save_pending_copy(&saved_items) {
+            self.status = format!("无法保存文件复制恢复检查点，未开始复制：{error}");
             return;
         }
         self.invalidate_after_copy_change();
@@ -2456,16 +2506,20 @@ impl PhotoArchiveApp {
         self.work_receiver = Some(receiver);
         self.work_control = Some(control);
         thread::spawn(move || {
-            let (results, cancelled) =
-                pipeline::copy_batch(items, &worker_control, |completed, total, bytes| {
-                    if completed % 32 == 0 || completed == total {
-                        let _ = sender.send(WorkMessage::CopyProgress {
-                            completed,
-                            total,
-                            bytes,
-                        });
-                    }
-                });
+            let progress = |completed, total, bytes| {
+                if completed % 32 == 0 || completed == total {
+                    let _ = sender.send(WorkMessage::CopyProgress {
+                        completed,
+                        total,
+                        bytes,
+                    });
+                }
+            };
+            let (results, cancelled) = if resume_existing {
+                pipeline::resume_copy_batch(items, &worker_control, progress)
+            } else {
+                pipeline::copy_batch(items, &worker_control, progress)
+            };
             let _ = sender.send(WorkMessage::CopyComplete { results, cancelled });
         });
     }
@@ -2630,6 +2684,25 @@ impl PhotoArchiveApp {
                             self.copy_results.push(result);
                         }
                     }
+                    if !cancelled && self.copy_results.iter().all(|item| item.result.is_ok()) {
+                        self.pending_copy_resume = None;
+                        if let Err(error) = checkpoint::clear_pending_copy() {
+                            self.status = format!(
+                                "复制已完成，但无法清除恢复检查点：{error}。下次启动时会重新核对已存在目标。"
+                            );
+                        }
+                    } else {
+                        self.pending_copy_resume = checkpoint::load_pending_copy()
+                            .ok()
+                            .flatten()
+                            .and_then(|saved| {
+                                saved
+                                    .into_iter()
+                                    .map(restored_copy_item)
+                                    .collect::<std::io::Result<Vec<_>>>()
+                                    .ok()
+                            });
+                    }
                     let passed = self
                         .copy_results
                         .iter()
@@ -2638,7 +2711,7 @@ impl PhotoArchiveApp {
                     let failed = self.copy_results.len() - passed;
                     if cancelled {
                         self.status = format!(
-                            "复制已停止：完成 {passed}，失败 {failed}；其余项目未开始。可重新运行未落盘的项目。 "
+                            "复制已停止：完成 {passed}，失败 {failed}；剩余项目未开始。恢复计划已保存，可在重启后继续并复核已存在目标。"
                         );
                         self.apply_pending_stage();
                     } else {
@@ -2647,7 +2720,7 @@ impl PhotoArchiveApp {
                         );
                         self.handoff_title = "分类复制已完成".into();
                         self.handoff_description = format!(
-                            "本阶段产生 {} 项复制结果，成功 {} 项、失败 {} 项。目标路径和逐项结果留在本次会话内存中；下一阶段会重新读取源和目标文件计算 SHA-256。",
+                            "本阶段产生 {} 项复制结果，成功 {} 项、失败 {} 项。未完成复制计划保存在本机私有检查点；下次启动可选择恢复，已有目标会重新读取并校验。下一阶段仍会重新读取源和目标文件计算 SHA-256。",
                             self.copy_results.len(),
                             passed,
                             failed
@@ -3014,6 +3087,8 @@ impl PhotoArchiveApp {
                     None => "准备阶段任务…".into(),
                 };
                 ui.label(format!("阶段任务：{operation}"));
+            } else if self.pending_copy_resume.is_some() {
+                ui.label("阶段状态：发现可恢复的分类复制任务");
             } else if self.last_scan.is_some() {
                 ui.label("阶段状态：已扫描（来源文件清单保存在当前会话内存中）");
             } else {
@@ -3165,6 +3240,51 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn restore_pending_copy(&mut self) {
+        match checkpoint::load_pending_copy() {
+            Ok(Some(saved)) => match saved
+                .into_iter()
+                .map(restored_copy_item)
+                .collect::<std::io::Result<Vec<_>>>()
+            {
+                Ok(items) => {
+                    let count = items.len();
+                    self.pending_copy_resume = Some(items);
+                    self.stage = 2;
+                    self.status = format!(
+                        "发现上次未完成的分类复制任务（{count} 项）。请在阶段③选择恢复或丢弃；恢复会重新核对已有目标。"
+                    );
+                }
+                Err(error) => {
+                    self.status =
+                        format!("无法读取上次分类复制任务：{error}。记录仍保留供检查或丢弃。");
+                }
+            },
+            Ok(None) => self.pending_copy_resume = None,
+            Err(error) => {
+                self.status = format!("无法读取上次分类复制检查点：{error}。现有文件未被修改。");
+            }
+        }
+    }
+
+    fn resume_pending_copy(&mut self) {
+        let Some(items) = self.pending_copy_resume.take() else {
+            return;
+        };
+        self.stage = 2;
+        self.start_copy(items, false, true);
+    }
+
+    fn discard_pending_copy(&mut self) {
+        self.pending_copy_resume = None;
+        match checkpoint::clear_pending_copy() {
+            Ok(()) => self.status = "已丢弃未完成复制的恢复记录；现有目标文件未删除。".into(),
+            Err(error) => {
+                self.status = format!("无法删除未完成复制检查点：{error}；现有目标文件未修改。")
+            }
+        }
+    }
+
     fn persist_saved_review(&mut self) {
         self.clear_backup_results();
         let Some(manifest) = &self.final_manifest else {
@@ -3237,6 +3357,10 @@ impl PhotoArchiveApp {
     fn invalidate_copy_plan(&mut self) {
         self.copy_results.clear();
         self.copy_planned = 0;
+        self.pending_copy_resume = None;
+        if let Err(error) = checkpoint::clear_pending_copy() {
+            self.status = format!("无法清除过期复制检查点：{error}");
+        }
         self.invalidate_after_copy_change();
         self.status = "来源、路由或过滤设置已更改；依赖的旧结果已清除。".into();
     }
@@ -3817,6 +3941,69 @@ fn show_candidate_preview(
     });
 }
 
+fn saved_copy_item(item: &RoutedFile) -> checkpoint::SavedCopyItem {
+    let (modified_before_epoch, modified_seconds, modified_nanos) =
+        match item.expected_source.modified {
+            Some(time) => {
+                let (before_epoch, duration) = match time.duration_since(SystemTime::UNIX_EPOCH) {
+                    Ok(duration) => (false, duration),
+                    Err(error) => (true, error.duration()),
+                };
+                (
+                    before_epoch,
+                    Some(duration.as_secs()),
+                    Some(duration.subsec_nanos()),
+                )
+            }
+            None => (false, None, None),
+        };
+    checkpoint::SavedCopyItem {
+        source: item.source.clone(),
+        destination: item.destination.clone(),
+        expected_size: item.expected_source.size,
+        modified_before_epoch,
+        modified_seconds,
+        modified_nanos,
+        expected_sha256: item.expected_sha256.clone(),
+    }
+}
+
+fn restored_copy_item(item: checkpoint::SavedCopyItem) -> std::io::Result<RoutedFile> {
+    let modified = match (item.modified_seconds, item.modified_nanos) {
+        (Some(seconds), Some(nanos)) => {
+            let duration = Duration::new(seconds, nanos);
+            let time = if item.modified_before_epoch {
+                SystemTime::UNIX_EPOCH.checked_sub(duration)
+            } else {
+                SystemTime::UNIX_EPOCH.checked_add(duration)
+            }
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "复制任务修改时间超出系统范围",
+                )
+            })?;
+            Some(time)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "复制任务修改时间字段不完整",
+            ));
+        }
+    };
+    Ok(RoutedFile {
+        source: item.source,
+        destination: item.destination,
+        expected_source: FileStamp {
+            size: item.expected_size,
+            modified,
+        },
+        expected_sha256: item.expected_sha256,
+    })
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -3833,6 +4020,7 @@ fn main() -> eframe::Result {
                 .set_visuals(eframe::egui::Visuals::light());
             let mut app = PhotoArchiveApp::default();
             app.restore_saved_review();
+            app.restore_pending_copy();
             Ok(Box::new(app))
         }),
     )
@@ -3877,6 +4065,27 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn pending_copy_plan_preserves_source_stamp() {
+        let root = temp_dir();
+        let source = root.join("source.jpg");
+        fs::write(&source, b"resume sample").unwrap();
+        let item = RoutedFile {
+            source: source.clone(),
+            destination: root.join("destination.jpg"),
+            expected_source: files::file_stamp(&source).unwrap(),
+            expected_sha256: Some("a".repeat(64)),
+        };
+
+        let restored = restored_copy_item(saved_copy_item(&item)).unwrap();
+
+        assert_eq!(restored.source, item.source);
+        assert_eq!(restored.destination, item.destination);
+        assert_eq!(restored.expected_source, item.expected_source);
+        assert_eq!(restored.expected_sha256, item.expected_sha256);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

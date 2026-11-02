@@ -200,6 +200,17 @@ pub fn sha256_file(path: impl AsRef<Path>) -> io::Result<String> {
     Ok(hash_reader(&mut file)?.1)
 }
 
+pub fn file_stamp(path: impl AsRef<Path>) -> io::Result<FileStamp> {
+    let path = path.as_ref();
+    if !fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("source is not a regular file: {}", path.display()),
+        ));
+    }
+    Ok(stamp(&File::open(path)?.metadata()?))
+}
+
 fn hash_reader(reader: &mut impl Read) -> io::Result<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; BUFFER_SIZE];

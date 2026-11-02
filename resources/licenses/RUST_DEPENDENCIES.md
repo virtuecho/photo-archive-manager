@@ -2,7 +2,7 @@ Photo Archive Manager and Rust dependency license report
 Generated from Cargo.lock with cargo-about. License expressions with OR use the first accepted option in about.toml.
 
 License overview:
-- Apache License 2.0: 222 package(s)
+- Apache License 2.0: 224 package(s)
 - MIT License: 53 package(s)
 - zlib License: 3 package(s)
 - Unicode License v3: 2 package(s)
@@ -6216,7 +6216,9 @@ Used by:
 - raw-window-handle 0.6.2
 - rustversion 1.0.23
 - semver 1.0.28
+- serde 1.0.229
 - serde_core 1.0.229
+- serde_derive 1.0.229
 - serde_json 1.0.154
 - shlex 2.0.1
 - simdutf8 0.1.5
