@@ -216,6 +216,20 @@ struct FinalManifest {
 }
 
 impl FinalManifest {
+    fn from_review(
+        root: PathBuf,
+        report: &duplicates::DuplicateReport,
+        excluded_paths: &std::collections::BTreeSet<PathBuf>,
+    ) -> Self {
+        let file_sha256 = report
+            .file_sha256
+            .iter()
+            .filter(|(path, _)| !excluded_paths.contains(*path))
+            .map(|(path, sha256)| (path.clone(), sha256.clone()))
+            .collect();
+        Self { root, file_sha256 }
+    }
+
     fn applies_to(&self, source: &Path) -> bool {
         source.starts_with(&self.root) || self.root.starts_with(source)
     }
@@ -370,7 +384,13 @@ impl PhotoArchiveApp {
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if ui.button("添加来源文件夹…").clicked() {
+            if ui
+                .add_enabled(
+                    !self.scanning && !self.work_running,
+                    eframe::egui::Button::new("添加来源文件夹…"),
+                )
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     match insert_source_root(&mut self.roots, path.clone()) {
                         Ok(true) => {
@@ -379,8 +399,9 @@ impl PhotoArchiveApp {
                                 .roots
                                 .iter()
                                 .position(|root| Some(&root.path) == canonical.as_ref());
+                            self.invalidate_copy_plan();
                             self.last_scan = None;
-                            self.status = "已添加来源目录。".into();
+                            self.status = "已添加来源目录；旧扫描与依赖结果已清除。".into();
                         }
                         Ok(false) => {
                             self.status = "该目录已包含在现有来源中，无需重复添加。".into()
@@ -394,20 +415,21 @@ impl PhotoArchiveApp {
                 .is_some_and(|index| index < self.roots.len());
             if ui
                 .add_enabled(
-                    can_remove && !self.scanning,
+                    can_remove && !self.scanning && !self.work_running,
                     eframe::egui::Button::new("移除选中目录"),
                 )
                 .clicked()
             {
                 if let Some(index) = self.selected_root.take() {
                     self.roots.remove(index);
+                    self.invalidate_copy_plan();
                     self.last_scan = None;
-                    self.status = "已移除来源目录。".into();
+                    self.status = "已移除来源目录；旧扫描与依赖结果已清除。".into();
                 }
             }
             if ui
                 .add_enabled(
-                    !self.roots.is_empty() && !self.scanning,
+                    !self.roots.is_empty() && !self.scanning && !self.work_running,
                     eframe::egui::Button::new("扫描来源"),
                 )
                 .clicked()
@@ -520,12 +542,17 @@ impl PhotoArchiveApp {
             return;
         }
 
+        let mut routes_changed = false;
         ui.horizontal(|ui| {
             ui.label("新增扩展名");
-            ui.add(
+            ui.add_enabled(
+                !self.work_running,
                 eframe::egui::TextEdit::singleline(&mut self.new_extension).hint_text("例如 XMP"),
             );
-            if ui.button("添加规则").clicked() {
+            if ui
+                .add_enabled(!self.work_running, eframe::egui::Button::new("添加规则"))
+                .clicked()
+            {
                 let extension = self
                     .new_extension
                     .trim()
@@ -540,6 +567,7 @@ impl PhotoArchiveApp {
                     });
                     self.routes.sort_by(|a, b| a.extension.cmp(&b.extension));
                     self.new_extension.clear();
+                    routes_changed = true;
                 }
             }
         });
@@ -573,10 +601,21 @@ impl PhotoArchiveApp {
                                 .map(|path| path.display().to_string())
                                 .unwrap_or_else(|| "未设置目标".into()),
                         );
-                        if ui.button("选择目标文件夹…").clicked() {
+                        if ui
+                            .add_enabled(
+                                !self.work_running,
+                                eframe::egui::Button::new("选择目标文件夹…"),
+                            )
+                            .clicked()
+                        {
                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                                 match fs::canonicalize(&path) {
-                                    Ok(path) => route.destination = Some(path),
+                                    Ok(path) => {
+                                        if route.destination.as_ref() != Some(&path) {
+                                            route.destination = Some(path);
+                                            routes_changed = true;
+                                        }
+                                    }
                                     Err(error) => {
                                         self.status =
                                             format!("无法解析目标目录 {}：{error}", path.display());
@@ -585,7 +624,9 @@ impl PhotoArchiveApp {
                             }
                         }
                         if !required_extensions.contains(&route.extension)
-                            && ui.small_button("移除").clicked()
+                            && ui
+                                .add_enabled(!self.work_running, eframe::egui::Button::new("移除"))
+                                .clicked()
                         {
                             selected_route = Some(index);
                         }
@@ -594,6 +635,7 @@ impl PhotoArchiveApp {
             });
         if let Some(index) = selected_route {
             self.routes.remove(index);
+            routes_changed = true;
         }
         ui.add_space(8.0);
         let missing = required_extensions
@@ -618,14 +660,25 @@ impl PhotoArchiveApp {
                 ),
             );
         }
+        if routes_changed {
+            self.invalidate_copy_plan();
+        }
     }
 
     fn copy_stage(&mut self, ui: &mut eframe::egui::Ui) {
         ui.label("复制只写入所选目标目录，不修改来源；目标已有同名文件时会报错且不会覆盖。");
-        ui.checkbox(
-            &mut self.include_system_files,
-            "包括系统垃圾文件（.DS_Store、._*、Thumbs.db、desktop.ini 等）",
-        );
+        if ui
+            .add_enabled(
+                !self.work_running,
+                eframe::egui::Checkbox::new(
+                    &mut self.include_system_files,
+                    "包括系统垃圾文件（.DS_Store、._*、Thumbs.db、desktop.ini 等）",
+                ),
+            )
+            .changed()
+        {
+            self.invalidate_copy_plan();
+        }
         let plan = self.copy_plan();
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -749,14 +802,34 @@ impl PhotoArchiveApp {
         ui.separator();
         ui.label("独立校验：选择一个来源文件夹和一个整理后文件夹，按相对路径匹配并核对文件数、缺失/多余文件及 SHA-256。");
         ui.horizontal(|ui| {
-            if ui.button("选择来源文件夹…").clicked() {
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new("选择来源文件夹…"),
+                )
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.direct_verify_source = fs::canonicalize(&path).ok();
+                    let selected = fs::canonicalize(&path).ok();
+                    if self.direct_verify_source != selected {
+                        self.direct_verify_source = selected;
+                        self.clear_verify_results();
+                    }
                 }
             }
-            if ui.button("选择目标文件夹…").clicked() {
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new("选择目标文件夹…"),
+                )
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.direct_verify_target = fs::canonicalize(&path).ok();
+                    let selected = fs::canonicalize(&path).ok();
+                    if self.direct_verify_target != selected {
+                        self.direct_verify_target = selected;
+                        self.clear_verify_results();
+                    }
                 }
             }
             if ui
@@ -1040,7 +1113,13 @@ impl PhotoArchiveApp {
     fn duplicates_stage(&mut self, ui: &mut eframe::egui::Ui) {
         ui.label("重新扫描所选目录并读取可信拍摄时间。SHA-256 相同表示字节完全相同；时间接近与 pHash 只产生人工审核候选，不会自动删除文件。");
         ui.horizontal(|ui| {
-            if ui.button("选择待检查目录…").clicked() {
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new("选择待检查目录…"),
+                )
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     match fs::canonicalize(&path) {
                         Ok(path) => {
@@ -1075,19 +1154,32 @@ impl PhotoArchiveApp {
         if let Some(path) = &self.duplicate_directory {
             ui.weak(format!("所选目录：{}", path.display()));
         }
+        let mut duplicate_options_changed = false;
         ui.horizontal(|ui| {
-            ui.add(
-                eframe::egui::Slider::new(
-                    &mut self.duplicate_options.time_threshold_seconds,
-                    0..=60,
+            duplicate_options_changed |= ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Slider::new(
+                        &mut self.duplicate_options.time_threshold_seconds,
+                        0..=60,
+                    )
+                    .text("拍摄时间窗口（秒）"),
                 )
-                .text("拍摄时间窗口（秒）"),
-            );
-            ui.add(
-                eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=64)
-                    .text("pHash 相似阈值（汉明距离）"),
-            );
+                .changed();
+            duplicate_options_changed |= ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=64)
+                        .text("pHash 相似阈值（汉明距离）"),
+                )
+                .changed();
         });
+        if duplicate_options_changed {
+            self.duplicate_report = None;
+            self.clear_candidate_preview();
+            self.clear_saved_review();
+            self.status = "重复检查阈值已更改；请重新扫描后再携带审核结果。".into();
+        }
         ui.weak("时区未知的拍摄时间不会参与跨文件比较。视频仍参与 SHA-256 和时间候选，但不计算静态照片 pHash。当前离线解码器仅支持 JPEG/PNG，其余格式会显示原因。");
         if !self.status.is_empty() {
             ui.label(&self.status);
@@ -1117,8 +1209,17 @@ impl PhotoArchiveApp {
                 format!("{} 个文件读取 SHA-256 失败。", report.hash_errors.len()),
             );
         }
-        if ui.button("清除本次排除标记（全部保留）").clicked() {
+        let mut review_changed = false;
+        if ui
+            .add_enabled(
+                !self.work_running && !self.excluded_final_paths.is_empty(),
+                eframe::egui::Button::new("清除本次排除标记（全部保留）"),
+            )
+            .clicked()
+            && !self.excluded_final_paths.is_empty()
+        {
             self.excluded_final_paths.clear();
+            review_changed = true;
         }
 
         let mut preview_request = None;
@@ -1138,9 +1239,12 @@ impl PhotoArchiveApp {
                             for path in &group.paths {
                                 let mut exclude = self.excluded_final_paths.contains(path);
                                 if ui
-                                    .checkbox(
-                                        &mut exclude,
-                                        format!("排除本次最终清单：{}", path.display()),
+                                    .add_enabled(
+                                        !self.work_running,
+                                        eframe::egui::Checkbox::new(
+                                            &mut exclude,
+                                            format!("排除本次最终清单：{}", path.display()),
+                                        ),
                                     )
                                     .changed()
                                 {
@@ -1149,6 +1253,7 @@ impl PhotoArchiveApp {
                                     } else {
                                         self.excluded_final_paths.remove(path);
                                     }
+                                    review_changed = true;
                                 }
                             }
                         });
@@ -1196,9 +1301,12 @@ impl PhotoArchiveApp {
                             }
                             let mut exclude = self.excluded_final_paths.contains(&candidate.second);
                             if ui
-                                .checkbox(
-                                    &mut exclude,
-                                    format!("排除本次最终清单：{}", candidate.second.display()),
+                                .add_enabled(
+                                    !self.work_running,
+                                    eframe::egui::Checkbox::new(
+                                        &mut exclude,
+                                        format!("排除本次最终清单：{}", candidate.second.display()),
+                                    ),
                                 )
                                 .changed()
                             {
@@ -1207,6 +1315,7 @@ impl PhotoArchiveApp {
                                 } else {
                                     self.excluded_final_paths.remove(&candidate.second);
                                 }
+                                review_changed = true;
                             }
                         });
                     }
@@ -1224,6 +1333,9 @@ impl PhotoArchiveApp {
                     ));
                 }
             });
+        if review_changed && self.final_manifest.is_some() {
+            self.refresh_carried_review();
+        }
         if let Some((first, second)) = preview_request {
             self.start_candidate_preview(first, second);
         }
@@ -1263,6 +1375,7 @@ impl PhotoArchiveApp {
                 self.status = "已清除本机阶段⑥审核清单；后续备份将重新扫描所选目录。".into();
             }
         }
+        let mut mappings_changed = false;
         if ui
             .add_enabled(
                 !self.work_running,
@@ -1272,10 +1385,13 @@ impl PhotoArchiveApp {
         {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 match fs::canonicalize(&path) {
-                    Ok(path) => self.backup_mappings.push(BackupMapping {
-                        source: Some(path),
-                        targets: Vec::new(),
-                    }),
+                    Ok(path) => {
+                        self.backup_mappings.push(BackupMapping {
+                            source: Some(path),
+                            targets: Vec::new(),
+                        });
+                        mappings_changed = true;
+                    }
                     Err(error) => {
                         self.status = format!("无法读取所选来源 {}：{error}", path.display());
                     }
@@ -1290,16 +1406,29 @@ impl PhotoArchiveApp {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.strong(format!("来源文件夹 {}", index + 1));
-                    if ui.button("移除此行").clicked() {
+                    if ui
+                        .add_enabled(!self.work_running, eframe::egui::Button::new("移除此行"))
+                        .clicked()
+                    {
                         remove_mapping = Some(index);
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("选择/更改来源…").clicked()
+                    if ui
+                        .add_enabled(
+                            !self.work_running,
+                            eframe::egui::Button::new("选择/更改来源…"),
+                        )
+                        .clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
                     {
                         match fs::canonicalize(&path) {
-                            Ok(path) => mapping.source = Some(path),
+                            Ok(path) => {
+                                if mapping.source.as_ref() != Some(&path) {
+                                    mapping.source = Some(path);
+                                    mappings_changed = true;
+                                }
+                            }
                             Err(error) => {
                                 self.status = format!("无法读取来源 {}：{error}", path.display());
                             }
@@ -1313,18 +1442,27 @@ impl PhotoArchiveApp {
                 for (target_index, target) in mapping.targets.iter().enumerate() {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("备份目标：{}", target.display()));
-                        if ui.button("移除目标").clicked() {
+                        if ui
+                            .add_enabled(!self.work_running, eframe::egui::Button::new("移除目标"))
+                            .clicked()
+                        {
                             remove_target = Some(target_index);
                         }
                     });
                 }
-                if ui.button("+ 添加备份目标文件夹…").clicked()
+                if ui
+                    .add_enabled(
+                        !self.work_running,
+                        eframe::egui::Button::new("+ 添加备份目标文件夹…"),
+                    )
+                    .clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_folder()
                 {
                     match fs::canonicalize(&path) {
                         Ok(path) => {
                             if !mapping.targets.contains(&path) {
                                 mapping.targets.push(path);
+                                mappings_changed = true;
                             }
                         }
                         Err(error) => {
@@ -1335,11 +1473,17 @@ impl PhotoArchiveApp {
             });
             if let Some(target_index) = remove_target {
                 mapping.targets.remove(target_index);
+                mappings_changed = true;
             }
             self.backup_mappings[index] = mapping;
         }
         if let Some(index) = remove_mapping {
             self.backup_mappings.remove(index);
+            mappings_changed = true;
+        }
+        if mappings_changed {
+            self.clear_backup_results();
+            self.status = "备份映射已修改；旧备份校验结果已清除。".into();
         }
 
         let ready = self
@@ -1479,7 +1623,12 @@ impl PhotoArchiveApp {
             "超过单卷大小时会输出 .7z.001/.002… 卷集；它们是一份逻辑归档，请保持所有卷同目录并确保卷齐全。",
         );
         ui.horizontal_wrapped(|ui| {
-            if ui.button("选择归档来源文件夹…").clicked()
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new("选择归档来源文件夹…"),
+                )
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
             {
                 match fs::canonicalize(&path) {
@@ -1501,7 +1650,12 @@ impl PhotoArchiveApp {
             ));
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button("选择输出目录…").clicked()
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new("选择输出目录…"),
+                )
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
             {
                 match fs::canonicalize(&path) {
@@ -1518,12 +1672,19 @@ impl PhotoArchiveApp {
         });
         ui.horizontal(|ui| {
             ui.label("归档名称（默认日期为 UTC，可修改）");
-            if ui.text_edit_singleline(&mut self.archive_name).changed() {
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::TextEdit::singleline(&mut self.archive_name),
+                )
+                .changed()
+            {
                 self.archive_name_custom = true;
             }
             ui.label("（自动补 .7z）");
         });
-        ui.add(
+        ui.add_enabled(
+            !self.work_running,
             eframe::egui::Slider::new(&mut self.archive_options.volume_mb, 1..=2000)
                 .text("单卷上限（十进制 MB）"),
         );
@@ -1560,19 +1721,27 @@ impl PhotoArchiveApp {
         }
         ui.horizontal(|ui| {
             ui.label("密码");
-            ui.add(
+            ui.add_enabled(
+                !self.work_running,
                 eframe::egui::TextEdit::singleline(&mut self.archive_password)
                     .password(!self.archive_show_password)
                     .desired_width(240.0),
             );
             ui.label("确认密码");
-            ui.add(
+            ui.add_enabled(
+                !self.work_running,
                 eframe::egui::TextEdit::singleline(&mut self.archive_confirmation)
                     .password(!self.archive_show_password)
                     .desired_width(240.0),
             );
-            ui.checkbox(&mut self.archive_show_password, "显示");
-            if ui.button("清空密码").clicked() {
+            ui.add_enabled(
+                !self.work_running,
+                eframe::egui::Checkbox::new(&mut self.archive_show_password, "显示"),
+            );
+            if ui
+                .add_enabled(!self.work_running, eframe::egui::Button::new("清空密码"))
+                .clicked()
+            {
                 self.archive_password.zeroize();
                 self.archive_confirmation.zeroize();
             }
@@ -2269,10 +2438,9 @@ impl PhotoArchiveApp {
         if items.is_empty() || self.work_running {
             return;
         }
+        self.invalidate_after_copy_change();
         if !preserve_existing {
             self.copy_results.clear();
-            self.verify_results.clear();
-            self.verify_coverage = None;
             self.copy_planned = items.len();
         }
         self.work_completed = 0;
@@ -2921,7 +3089,7 @@ impl PhotoArchiveApp {
 
     fn start_scan(&mut self) {
         let roots: Vec<PathBuf> = self.roots.iter().map(|root| root.path.clone()).collect();
-        self.clear_saved_review();
+        self.invalidate_copy_plan();
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -2997,6 +3165,7 @@ impl PhotoArchiveApp {
     }
 
     fn persist_saved_review(&mut self) {
+        self.clear_backup_results();
         let Some(manifest) = &self.final_manifest else {
             self.clear_saved_review();
             return;
@@ -3021,9 +3190,54 @@ impl PhotoArchiveApp {
         self.final_manifest = None;
         self.review_checkpoint_saved = false;
         self.excluded_final_paths.clear();
+        self.clear_backup_results();
         if let Err(error) = checkpoint::clear() {
             self.status = format!("无法清除本机阶段⑥恢复检查点：{error}");
         }
+    }
+
+    fn refresh_carried_review(&mut self) {
+        let (Some(root), Some(report)) = (
+            self.duplicate_directory.clone(),
+            self.duplicate_report.as_ref(),
+        ) else {
+            return;
+        };
+        self.final_manifest = Some(FinalManifest::from_review(
+            root,
+            report,
+            &self.excluded_final_paths,
+        ));
+        self.persist_saved_review();
+        if self.review_checkpoint_saved {
+            self.status = "阶段⑥最终清单已更新；此前备份校验结果已清除。".into();
+        }
+    }
+
+    fn clear_backup_results(&mut self) {
+        self.backup_copies.clear();
+        self.backup_verification.clear();
+    }
+
+    fn clear_verify_results(&mut self) {
+        self.verify_results.clear();
+        self.verify_coverage = None;
+        self.status = "校验路径已更改；旧校验结果已清除。".into();
+    }
+
+    fn invalidate_after_copy_change(&mut self) {
+        self.clear_verify_results();
+        self.metadata_results.clear();
+        self.duplicate_report = None;
+        self.clear_candidate_preview();
+        self.clear_saved_review();
+    }
+
+    fn invalidate_copy_plan(&mut self) {
+        self.copy_results.clear();
+        self.copy_planned = 0;
+        self.invalidate_after_copy_change();
+        self.status = "来源、路由或过滤设置已更改；依赖的旧结果已清除。".into();
     }
 
     fn receive_scan_updates(&mut self) {
@@ -3102,20 +3316,8 @@ impl PhotoArchiveApp {
         match action {
             Some(0) => {
                 self.show_handoff = false;
-                if self.stage == 5
-                    && let (Some(root), Some(report)) = (
-                        self.duplicate_directory.clone(),
-                        self.duplicate_report.as_ref(),
-                    )
-                {
-                    let file_sha256 = report
-                        .file_sha256
-                        .iter()
-                        .filter(|(path, _)| !self.excluded_final_paths.contains(*path))
-                        .map(|(path, sha256)| (path.clone(), sha256.clone()))
-                        .collect();
-                    self.final_manifest = Some(FinalManifest { root, file_sha256 });
-                    self.persist_saved_review();
+                if self.stage == 5 {
+                    self.refresh_carried_review();
                 }
                 self.stage = (self.stage + 1).min(STAGES.len() - 1);
             }
@@ -3640,6 +3842,30 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn carried_manifest_reflects_current_exclusions() {
+        let root = PathBuf::from("/photos");
+        let kept = root.join("keep.jpg");
+        let excluded = root.join("exclude.jpg");
+        let report = duplicates::DuplicateReport {
+            file_sha256: BTreeMap::from([
+                (kept.clone(), "a".repeat(64)),
+                (excluded.clone(), "b".repeat(64)),
+            ]),
+            ..Default::default()
+        };
+        let manifest = FinalManifest::from_review(
+            root.clone(),
+            &report,
+            &std::collections::BTreeSet::from([excluded.clone()]),
+        );
+
+        assert_eq!(manifest.root, root);
+        assert_eq!(manifest.file_sha256.len(), 1);
+        assert!(manifest.file_sha256.contains_key(&kept));
+        assert!(!manifest.file_sha256.contains_key(&excluded));
+    }
 
     fn temp_dir() -> PathBuf {
         let suffix = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
