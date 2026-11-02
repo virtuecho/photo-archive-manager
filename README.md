@@ -1,1 +1,19 @@
-# photo-archive-manager
+# Photo Archive Manager
+
+离线本地照片整理工具。当前原生八阶段窗口已接通来源扫描、扩展名路由、安全复制和完整性校验；其他阶段仍在实现中。
+
+## 本机运行
+
+需要 Rust 工具链：
+
+```sh
+cargo run
+```
+
+扫描只读取常规文件，不跟随符号链接；扫描结果和清单暂存在当前进程内存中。复制使用有界缓冲区、临时文件、SHA-256 和防覆盖提交。完整性阶段会再次读取源/目标文件；也可单独选择两个目录按相对路径核对。系统垃圾过滤可审核并可恢复包含。
+
+`cargo test` 覆盖扫描、来源变更拒绝、复制、同大小目标改写识别、系统垃圾过滤和加密 Store 7z 单卷 PoC。PoC 不代表已支持官方 7-Zip 互操作或多卷归档。
+
+## 当前交付状态
+
+请先读 [`docs/implementation-status.md`](docs/implementation-status.md)。`target/` 下的构建产物只是本机开发产物；尚无经过干净系统离线验收的 Windows/macOS 自包含发布包。
