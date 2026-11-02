@@ -274,7 +274,7 @@ fn phash_32(pixels: &image::GrayImage) -> u64 {
     let mut low_frequency: Vec<f64> = coefficients[1..].to_vec();
     low_frequency.sort_by(f64::total_cmp);
     let median = low_frequency[low_frequency.len() / 2];
-    coefficients[1..]
+    coefficients
         .iter()
         .enumerate()
         .fold(0u64, |hash, (bit, value)| {
@@ -346,6 +346,12 @@ mod tests {
         });
         assert_eq!(phash_32(&stripes), phash_32(&stripes.clone()));
         assert!((phash_32(&stripes) ^ phash_32(&shifted)).count_ones() > 0);
+    }
+
+    #[test]
+    fn perceptual_hash_uses_the_full_64_bits() {
+        let white = GrayImage::from_pixel(32, 32, Luma([255]));
+        assert_ne!(phash_32(&white) & (1u64 << 63), 0);
     }
 
     #[test]

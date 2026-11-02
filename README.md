@@ -14,12 +14,12 @@ cargo run
 
 阶段⑤会重新读取所选整理目录或本次复制清单中的文件，显示 GPS、原始拍摄时间、精度、时区状态、来源标签及可用相机信息。ExifTool 13.60 与 Perl runtime 已嵌入本机 macOS arm64 构建，运行时不从 `PATH` 查找工具。Windows 和 macOS Intel 尚无相应有效载荷，阶段⑤会如实禁用。第三方来源、许可和二进制校验值见 [`resources/exiftool/THIRD_PARTY_NOTICES.md`](resources/exiftool/THIRD_PARTY_NOTICES.md)。
 
-阶段⑥每次重新扫描目录并重算文件 SHA-256；带可信时区的拍摄时间按逐对阈值生成候选，不做传递合并；JPEG/PNG 时间候选可计算离线 pHash。候选只能手动标记从本次清单排除，不会删除文件。HEIC/RAW 解码、图片预览及完整 Final Manifest 流程尚未完成。阶段⑦支持每个本地文件夹映射到多个备份目标，拒绝路径重叠，并逐文件重新读取源/目标进行 SHA-256 校验。暂停、断点恢复和跨阶段文件变化失效联动尚未完成。
+阶段⑥每次重新扫描目录并重算文件 SHA-256；带可信时区的拍摄时间按逐对阈值生成候选，不做传递合并；JPEG/PNG 时间候选可计算 64-bit 离线 pHash，并可并排预览且应用 EXIF 方向。候选只能手动标记从本次清单排除，不会删除文件。HEIC/RAW 预览解码及完整 Final Manifest 流程尚未完成。阶段⑦支持每个本地文件夹映射到多个备份目标，拒绝路径重叠，并逐文件重新读取源/目标进行 SHA-256 校验。暂停、断点恢复和跨阶段文件变化失效联动尚未完成。
 
 阶段⑧可独立选择目录，以 GUI 双次输入密码创建 Store、AES-256、加密文件名的 7z 归档；默认每卷 2,000,000,000 字节。程序先写完整临时 7z，再按字节流切成 `.7z.001/.002/...`，逐卷限额，并在提交前重组卷流、核对完整清单及逐文件 SHA-256，最后防覆盖提交。应用内超过 2 GB 单文件测试通过；官方 7-Zip 26.05 将该两卷归档识别为 `Type = Split`，完成 `t` 与提取，解出文件和同尺寸稀疏源文件的 SHA-256 相同。分卷期间临时空间可能需要接近归档体积的两倍。密码输入由程序清空，但底层 7z 库内部密码缓冲区不保证主动擦零。第三方声明可从窗口底部“开源许可”打开。
 
-`cargo test` 最近一次为 25 passed、0 failed、3 ignored（两项需外部图片/MOV 样本；一项 2 GB 单文件压力用例需显式运行）。压力用例已用 Release 配置单独通过。覆盖扫描、元数据解析、重复 SHA/时间窗口边界、来源变更拒绝、同大小目标改写识别、多目标备份读回与多余文件检查、分卷 7z manifest/SHA-256 校验和缺少卷错误。官方 7-Zip 26.05 已通过小卷与大于 2 GB 单文件归档的 `t`，并从大归档提取后核对 SHA-256。
+`cargo test` 最近一次为 27 passed、0 failed、3 ignored（两项需外部图片/MOV 样本；一项 2 GB 单文件压力用例需显式运行）。压力用例已用 Release 配置单独通过。覆盖扫描、JPEG/PNG 预览解码、64-bit pHash、拍摄时间窗口边界、来源变更拒绝、同大小目标改写识别、多目标备份读回与多余文件检查、分卷 7z manifest/SHA-256 校验和缺少卷错误。官方 7-Zip 26.05 已通过小卷与大于 2 GB 单文件归档的 `t`，并从大归档提取后核对 SHA-256。
 
 ## 当前交付状态
 
-请先读 [`docs/implementation-status.md`](docs/implementation-status.md)。`target/` 下的构建产物只是本机开发产物；尚无经过干净系统离线验收的 Windows/macOS 自包含发布包。
+请先读 [`docs/implementation-status.md`](docs/implementation-status.md) 和 [`docs/release.md`](docs/release.md)。本机 macOS arm64 可用 `scripts/build-macos-arm64.sh` 重建；`target/` 下的构建产物只是开发文件，尚无经过干净系统离线验收的 Windows/macOS 自包含发布包。

@@ -204,6 +204,10 @@ struct ArchiveOptions {
     volume_mb: u32,
 }
 
+struct PreviewPixels {
+    image: image::RgbaImage,
+}
+
 impl Default for ArchiveOptions {
     fn default() -> Self {
         Self { volume_mb: 2000 }
@@ -235,6 +239,14 @@ struct PhotoArchiveApp {
     duplicate_options: DuplicateOptions,
     duplicate_report: Option<duplicates::DuplicateReport>,
     excluded_final_paths: std::collections::BTreeSet<PathBuf>,
+    candidate_preview_paths: Option<(PathBuf, PathBuf)>,
+    candidate_preview_receiver:
+        Option<Receiver<(Result<PreviewPixels, String>, Result<PreviewPixels, String>)>>,
+    candidate_preview_loading: bool,
+    candidate_preview_textures: Option<(
+        Result<eframe::egui::TextureHandle, String>,
+        Result<eframe::egui::TextureHandle, String>,
+    )>,
     backup_mappings: Vec<BackupMapping>,
     backup_copies: Vec<CopyItemResult>,
     backup_verification: Vec<VerifyItemResult>,
@@ -312,6 +324,7 @@ impl eframe::App for PhotoArchiveApp {
             self.footer(ui, &ctx);
         });
 
+        self.candidate_preview_dialog(&ctx);
         if self.show_handoff {
             self.handoff_dialog(&ctx);
         }
@@ -321,7 +334,12 @@ impl eframe::App for PhotoArchiveApp {
         if self.show_licenses {
             self.license_dialog(&ctx);
         }
-        if self.scanning || self.work_running || self.show_handoff || self.show_switch_prompt {
+        if self.scanning
+            || self.work_running
+            || self.candidate_preview_loading
+            || self.show_handoff
+            || self.show_switch_prompt
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1010,6 +1028,7 @@ impl PhotoArchiveApp {
                             self.duplicate_directory = Some(path);
                             self.duplicate_report = None;
                             self.excluded_final_paths.clear();
+                            self.clear_candidate_preview();
                         }
                         Err(error) => {
                             self.status = format!("无法读取所选目录 {}：{error}", path.display());
@@ -1046,7 +1065,7 @@ impl PhotoArchiveApp {
                 .text("拍摄时间窗口（秒）"),
             );
             ui.add(
-                eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=63)
+                eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=64)
                     .text("pHash 相似阈值（汉明距离）"),
             );
         });
@@ -1083,6 +1102,7 @@ impl PhotoArchiveApp {
             self.excluded_final_paths.clear();
         }
 
+        let mut preview_request = None;
         eframe::egui::ScrollArea::vertical()
             .id_salt("duplicate-report")
             .max_height(480.0)
@@ -1120,6 +1140,10 @@ impl PhotoArchiveApp {
                     ui.heading("拍摄时间候选（仅供人工复核）");
                     for candidate in &report.time_candidates {
                         ui.group(|ui| {
+                            if ui.button("并排预览（JPEG/PNG）").clicked() {
+                                preview_request =
+                                    Some((candidate.first.clone(), candidate.second.clone()));
+                            }
                             ui.label(format!(
                                 "时间差 {:.3} 秒{}",
                                 candidate.delta_millis as f64 / 1000.0,
@@ -1132,7 +1156,7 @@ impl PhotoArchiveApp {
                                             } else {
                                                 "视觉差异较大"
                                             };
-                                        format!(" · pHash 汉明距离 {distance}/63 · {class}")
+                                        format!(" · pHash 汉明距离 {distance}/64 · {class}")
                                     }
                                 )
                             ));
@@ -1181,6 +1205,9 @@ impl PhotoArchiveApp {
                     ));
                 }
             });
+        if let Some((first, second)) = preview_request {
+            self.start_candidate_preview(first, second);
+        }
     }
 
     fn backup_stage(&mut self, ui: &mut eframe::egui::Ui) {
@@ -1776,6 +1803,7 @@ impl PhotoArchiveApp {
         };
         self.duplicate_report = None;
         self.excluded_final_paths.clear();
+        self.clear_candidate_preview();
         self.work_completed = 0;
         self.work_total = 0;
         self.work_bytes = 0;
@@ -1863,6 +1891,78 @@ impl PhotoArchiveApp {
                 error,
             });
         });
+    }
+
+    fn candidate_preview_dialog(&mut self, ctx: &eframe::egui::Context) {
+        let completed = self
+            .candidate_preview_receiver
+            .as_ref()
+            .map(Receiver::try_recv);
+        match completed {
+            Some(Ok((first, second))) => {
+                self.candidate_preview_receiver = None;
+                self.candidate_preview_loading = false;
+                if let Some((first_path, second_path)) = &self.candidate_preview_paths {
+                    self.candidate_preview_textures = Some((
+                        candidate_preview_texture(ctx, first_path, first),
+                        candidate_preview_texture(ctx, second_path, second),
+                    ));
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.candidate_preview_receiver = None;
+                self.candidate_preview_loading = false;
+                if self.candidate_preview_paths.is_some() {
+                    let error = "预览任务意外结束，请重新打开预览。".to_string();
+                    self.candidate_preview_textures = Some((Err(error.clone()), Err(error)));
+                }
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        let Some((first_path, second_path)) = self.candidate_preview_paths.clone() else {
+            return;
+        };
+        let mut open = true;
+        eframe::egui::Window::new("候选照片并排预览")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(960.0)
+            .show(ctx, |ui| {
+                if let Some((first_texture, second_texture)) = &self.candidate_preview_textures {
+                    ui.horizontal_top(|ui| {
+                        show_candidate_preview(ui, &first_path, first_texture);
+                        show_candidate_preview(ui, &second_path, second_texture);
+                    });
+                } else {
+                    ui.spinner();
+                    ui.label("正在读取图片并生成预览…");
+                }
+            });
+        if !open {
+            self.clear_candidate_preview();
+        }
+    }
+
+    fn start_candidate_preview(&mut self, first: PathBuf, second: PathBuf) {
+        let (sender, receiver) = mpsc::channel();
+        self.candidate_preview_paths = Some((first.clone(), second.clone()));
+        self.candidate_preview_receiver = Some(receiver);
+        self.candidate_preview_loading = true;
+        self.candidate_preview_textures = None;
+        thread::spawn(move || {
+            let result = (
+                decode_candidate_preview(&first),
+                decode_candidate_preview(&second),
+            );
+            let _ = sender.send(result);
+        });
+    }
+
+    fn clear_candidate_preview(&mut self) {
+        self.candidate_preview_paths = None;
+        self.candidate_preview_receiver = None;
+        self.candidate_preview_loading = false;
+        self.candidate_preview_textures = None;
     }
 
     fn start_metadata_for_copies(&mut self) {
@@ -2843,6 +2943,7 @@ impl PhotoArchiveApp {
                 self.archive_confirmation.zeroize();
                 self.archive_show_password = false;
             }
+            self.clear_candidate_preview();
             self.stage = stage;
         }
     }
@@ -2850,6 +2951,7 @@ impl PhotoArchiveApp {
     fn apply_pending_stage(&mut self) -> bool {
         self.show_switch_prompt = false;
         if let Some(stage) = self.pending_stage.take() {
+            self.clear_candidate_preview();
             self.stage = stage;
             true
         } else {
@@ -3199,6 +3301,62 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn decode_candidate_preview(path: &Path) -> Result<PreviewPixels, String> {
+    use image::ImageDecoder;
+
+    let reader = image::ImageReader::open(path)
+        .map_err(|error| format!("无法打开预览文件：{error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("无法识别图片格式：{error}"))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("当前预览仅支持 JPEG/PNG：{error}"))?;
+    let orientation = decoder
+        .orientation()
+        .map_err(|error| format!("无法读取图片方向：{error}"))?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("图片解码失败：{error}"))?;
+    decoded.apply_orientation(orientation);
+    Ok(PreviewPixels {
+        image: decoded.thumbnail(640, 640).to_rgba8(),
+    })
+}
+
+fn candidate_preview_texture(
+    ctx: &eframe::egui::Context,
+    path: &Path,
+    preview: Result<PreviewPixels, String>,
+) -> Result<eframe::egui::TextureHandle, String> {
+    let rgba = preview?.image;
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = eframe::egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    Ok(ctx.load_texture(
+        path.display().to_string(),
+        pixels,
+        eframe::egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn show_candidate_preview(
+    ui: &mut eframe::egui::Ui,
+    path: &Path,
+    preview: &Result<eframe::egui::TextureHandle, String>,
+) {
+    ui.vertical(|ui| {
+        ui.label(path.display().to_string());
+        match preview {
+            Ok(texture) => {
+                let size = texture.size_vec2();
+                let scale = (440.0 / size.x.max(size.y).max(1.0)).min(1.0);
+                ui.image((texture.id(), size * scale));
+            }
+            Err(error) => {
+                ui.colored_label(eframe::egui::Color32::from_rgb(160, 90, 0), error);
+            }
+        }
+    });
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -3233,6 +3391,26 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn candidate_preview_scales_supported_images_and_reports_unsupported_files() {
+        let root = temp_dir();
+        let image_path = root.join("preview.png");
+        image::RgbaImage::from_fn(1200, 800, |x, y| image::Rgba([x as u8, y as u8, 0, 255]))
+            .save(&image_path)
+            .unwrap();
+
+        let preview = decode_candidate_preview(&image_path).unwrap();
+        let (width, height) = preview.image.dimensions();
+        assert_eq!(width, 640);
+        assert!(height <= 640);
+
+        let unsupported = root.join("unsupported.bin");
+        fs::write(&unsupported, b"not an image").unwrap();
+        let error = decode_candidate_preview(&unsupported).err().unwrap();
+        assert!(error.contains("JPEG/PNG"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
