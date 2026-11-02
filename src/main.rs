@@ -274,7 +274,7 @@ struct PhotoArchiveApp {
     metadata_directory: Option<PathBuf>,
     metadata_results: Vec<MetadataRecord>,
     metadata_previous_results: Vec<MetadataRecord>,
-    resolved_metadata_paths: std::collections::BTreeSet<PathBuf>,
+    resolved_metadata_fields: BTreeMap<PathBuf, ResolvedMetadataFields>,
     accepted_metadata_warnings: BTreeMap<PathBuf, (MetadataStatus, MetadataStatus)>,
     duplicate_directory: Option<PathBuf>,
     duplicate_options: DuplicateOptions,
@@ -1020,7 +1020,7 @@ impl PhotoArchiveApp {
                             self.metadata_directory = Some(path);
                             self.metadata_results.clear();
                             self.metadata_previous_results.clear();
-                            self.resolved_metadata_paths.clear();
+                            self.resolved_metadata_fields.clear();
                             self.accepted_metadata_warnings.clear();
                         }
                         Err(error) => {
@@ -1088,12 +1088,16 @@ impl PhotoArchiveApp {
                 "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 警告 {warnings}（已接受 {accepted_warnings}）· 读取错误 {read_errors}",
                 self.metadata_results.len(),
             ));
-            if !self.resolved_metadata_paths.is_empty() {
+            let resolved_field_count = self
+                .resolved_metadata_fields
+                .values()
+                .map(|fields| fields.gps as usize + fields.capture_time as usize)
+                .sum::<usize>();
+            if resolved_field_count > 0 {
                 ui.colored_label(
                     eframe::egui::Color32::DARK_GREEN,
                     format!(
-                        "RESOLVED：本轮复查确认 {} 项先前异常已转为有效。",
-                        self.resolved_metadata_paths.len()
+                        "RESOLVED：本轮复查确认 {resolved_field_count} 个先前异常字段已转为有效。"
                     ),
                 );
             }
@@ -1104,12 +1108,7 @@ impl PhotoArchiveApp {
                     for item in self.metadata_results.iter().take(80) {
                         ui.group(|ui| {
                             ui.label(item.path.display().to_string());
-                            if self.resolved_metadata_paths.contains(&item.path) {
-                                ui.colored_label(
-                                    eframe::egui::Color32::DARK_GREEN,
-                                    "RESOLVED · 本轮复查已转为有效",
-                                );
-                            }
+                            let resolved = self.resolved_metadata_fields.get(&item.path);
                             if metadata_record_is_warning(item) {
                                 let status_pair = (item.gps_status, item.time_status);
                                 let accepted = self.accepted_metadata_warnings.get(&item.path)
@@ -1139,7 +1138,15 @@ impl PhotoArchiveApp {
                                     "类型：{}",
                                     item.file_type.as_deref().unwrap_or("未知")
                                 ));
-                                ui.label(format!("GPS：{}", item.gps_status.label()));
+                                let gps_status = format!("GPS：{}", item.gps_status.label());
+                                if resolved.is_some_and(|fields| fields.gps) {
+                                    ui.colored_label(
+                                        eframe::egui::Color32::DARK_GREEN,
+                                        format!("{gps_status} · RESOLVED"),
+                                    );
+                                } else {
+                                    ui.label(gps_status);
+                                }
                                 if let (Some(latitude), Some(longitude)) =
                                     (item.latitude, item.longitude)
                                 {
@@ -1156,7 +1163,16 @@ impl PhotoArchiveApp {
                                 }
                             });
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(format!("拍摄时间：{}", item.time_status.label()));
+                                let capture_time_status =
+                                    format!("拍摄时间：{}", item.time_status.label());
+                                if resolved.is_some_and(|fields| fields.capture_time) {
+                                    ui.colored_label(
+                                        eframe::egui::Color32::DARK_GREEN,
+                                        format!("{capture_time_status} · RESOLVED"),
+                                    );
+                                } else {
+                                    ui.label(capture_time_status);
+                                }
                                 if let Some(value) = &item.capture_normalized {
                                     ui.label(value);
                                     ui.weak(item.capture_precision.as_deref().unwrap_or(""));
@@ -2541,7 +2557,7 @@ impl PhotoArchiveApp {
             return;
         }
         self.metadata_previous_results = std::mem::take(&mut self.metadata_results);
-        self.resolved_metadata_paths.clear();
+        self.resolved_metadata_fields.clear();
         self.invalidate_file_results_for_rescan();
         self.work_completed = 0;
         self.work_total = 0;
@@ -3001,10 +3017,12 @@ impl PhotoArchiveApp {
                     self.work_control = None;
                     if cancelled {
                         self.metadata_previous_results.clear();
-                        self.resolved_metadata_paths.clear();
+                        self.resolved_metadata_fields.clear();
                     } else {
-                        self.resolved_metadata_paths =
-                            find_resolved_metadata_paths(&self.metadata_previous_results, &results);
+                        self.resolved_metadata_fields = find_resolved_metadata_fields(
+                            &self.metadata_previous_results,
+                            &results,
+                        );
                         self.metadata_previous_results.clear();
                     }
                     self.metadata_results = results;
@@ -3276,7 +3294,7 @@ impl PhotoArchiveApp {
                     if self.work_kind == Some(WorkKind::Metadata) {
                         self.metadata_results.clear();
                         self.metadata_previous_results.clear();
-                        self.resolved_metadata_paths.clear();
+                        self.resolved_metadata_fields.clear();
                         self.accepted_metadata_warnings.clear();
                     }
                     self.work_running = false;
@@ -3766,7 +3784,7 @@ impl PhotoArchiveApp {
         self.verify_needs_recheck = had_verify_results;
         self.metadata_results.clear();
         self.duplicate_report = None;
-        self.resolved_metadata_paths.clear();
+        self.resolved_metadata_fields.clear();
         self.clear_candidate_preview();
         self.clear_saved_review();
     }
@@ -3784,7 +3802,7 @@ impl PhotoArchiveApp {
         self.verify_needs_recheck = had_verify_results;
         self.metadata_results.clear();
         self.metadata_previous_results.clear();
-        self.resolved_metadata_paths.clear();
+        self.resolved_metadata_fields.clear();
         self.accepted_metadata_warnings.clear();
         self.duplicate_report = None;
         self.clear_candidate_preview();
@@ -3896,7 +3914,7 @@ impl PhotoArchiveApp {
                 self.metadata_directory = None;
                 self.metadata_results.clear();
                 self.metadata_previous_results.clear();
-                self.resolved_metadata_paths.clear();
+                self.resolved_metadata_fields.clear();
                 self.accepted_metadata_warnings.clear();
                 self.duplicate_report = None;
                 self.clear_saved_review();
@@ -4286,25 +4304,31 @@ fn is_system_junk(relative_path: &Path) -> bool {
         })
 }
 
-fn find_resolved_metadata_paths(
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResolvedMetadataFields {
+    gps: bool,
+    capture_time: bool,
+}
+
+fn find_resolved_metadata_fields(
     previous: &[MetadataRecord],
     current: &[MetadataRecord],
-) -> std::collections::BTreeSet<PathBuf> {
+) -> BTreeMap<PathBuf, ResolvedMetadataFields> {
     let current_status = current
         .iter()
         .map(|item| (item.path.clone(), (item.gps_status, item.time_status)))
         .collect::<BTreeMap<_, _>>();
     previous
         .iter()
-        .filter(|old| {
-            old.gps_status != MetadataStatus::Valid || old.time_status != MetadataStatus::Valid
+        .filter_map(|old| {
+            let (gps, time) = current_status.get(&old.path)?;
+            let resolved = ResolvedMetadataFields {
+                gps: old.gps_status != MetadataStatus::Valid && *gps == MetadataStatus::Valid,
+                capture_time: old.time_status != MetadataStatus::Valid
+                    && *time == MetadataStatus::Valid,
+            };
+            (resolved.gps || resolved.capture_time).then(|| (old.path.clone(), resolved))
         })
-        .filter(|old| {
-            current_status.get(&old.path).is_some_and(|(gps, time)| {
-                *gps == MetadataStatus::Valid && *time == MetadataStatus::Valid
-            })
-        })
-        .map(|item| item.path.clone())
         .collect()
 }
 
@@ -4576,9 +4600,10 @@ mod tests {
     }
 
     #[test]
-    fn metadata_recheck_marks_only_prior_warnings_that_are_now_fully_valid() {
+    fn metadata_recheck_marks_each_prior_warning_field_that_is_now_valid() {
         let fixed = PathBuf::from("/photos/fixed.jpg");
         let still_missing = PathBuf::from("/photos/still-missing.jpg");
+        let gps_fixed_time_missing = PathBuf::from("/photos/gps-fixed-time-missing.jpg");
         let newly_valid = PathBuf::from("/photos/new.jpg");
         let mut old_fixed = MetadataRecord::unsupported(fixed.clone(), "previous warning");
         old_fixed.gps_status = MetadataStatus::Missing;
@@ -4587,21 +4612,43 @@ mod tests {
             MetadataRecord::unsupported(still_missing.clone(), "previous warning");
         old_missing.gps_status = MetadataStatus::Valid;
         old_missing.time_status = MetadataStatus::Missing;
-        let previous = vec![old_fixed, old_missing];
+        let mut old_mixed =
+            MetadataRecord::unsupported(gps_fixed_time_missing.clone(), "previous warning");
+        old_mixed.gps_status = MetadataStatus::Missing;
+        old_mixed.time_status = MetadataStatus::Missing;
+        let previous = vec![old_fixed, old_missing, old_mixed];
         let mut current_fixed = MetadataRecord::unsupported(fixed.clone(), "");
         current_fixed.gps_status = MetadataStatus::Valid;
         current_fixed.time_status = MetadataStatus::Valid;
         let mut current_missing = MetadataRecord::unsupported(still_missing.clone(), "");
         current_missing.gps_status = MetadataStatus::Valid;
         current_missing.time_status = MetadataStatus::Missing;
+        let mut current_mixed = MetadataRecord::unsupported(gps_fixed_time_missing.clone(), "");
+        current_mixed.gps_status = MetadataStatus::Valid;
+        current_mixed.time_status = MetadataStatus::Missing;
         let mut current_new = MetadataRecord::unsupported(newly_valid, "");
         current_new.gps_status = MetadataStatus::Valid;
         current_new.time_status = MetadataStatus::Valid;
-        let current = vec![current_fixed, current_missing, current_new];
+        let current = vec![current_fixed, current_missing, current_mixed, current_new];
 
         assert_eq!(
-            find_resolved_metadata_paths(&previous, &current),
-            std::collections::BTreeSet::from([fixed])
+            find_resolved_metadata_fields(&previous, &current),
+            BTreeMap::from([
+                (
+                    fixed,
+                    ResolvedMetadataFields {
+                        gps: true,
+                        capture_time: false,
+                    },
+                ),
+                (
+                    gps_fixed_time_missing,
+                    ResolvedMetadataFields {
+                        gps: true,
+                        capture_time: false,
+                    },
+                ),
+            ])
         );
     }
 
