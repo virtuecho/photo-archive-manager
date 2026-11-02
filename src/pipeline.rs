@@ -10,6 +10,7 @@ pub struct RoutedFile {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub expected_source: FileStamp,
+    pub expected_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,9 +44,13 @@ pub fn copy_batch(
             break;
         }
 
-        let result =
-            files::copy_verified(&item.source, &item.destination, Some(item.expected_source))
-                .map_err(|error| error.to_string());
+        let result = files::copy_verified(
+            &item.source,
+            &item.destination,
+            Some(item.expected_source),
+            item.expected_sha256.as_deref(),
+        )
+        .map_err(|error| error.to_string());
         if let Ok(receipt) = &result {
             copied_bytes = copied_bytes.saturating_add(receipt.size);
         }

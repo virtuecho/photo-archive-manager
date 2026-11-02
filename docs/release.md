@@ -25,7 +25,7 @@ cargo test --release archive::tests::archives_a_single_file_larger_than_the_defa
 ## 已知限制
 
 - ExifTool 仅有 macOS arm64 嵌入构建；Windows、macOS Intel 需补齐真正自包含的对应运行时。
-- 重复检查支持 JPEG/PNG pHash 与并排预览，没有 HEIC/RAW 解码和持久 Final Manifest；排除决定只保存在当前会话。
+- 重复检查支持 JPEG/PNG pHash 与并排预览；当前会话携带阶段⑥结果后会生成内存 Final Manifest，备份/归档仅处理其确认路径并复核哈希。没有 HEIC/RAW 解码或持久/导出的 Final Manifest，排除决定只保存在当前会话。
 - 文件在阶段间被外部修改时，尚未实现完整的跨阶段自动失效与依赖重检联动。
 - 备份没有暂停/断点恢复。归档先写临时单文件再切卷，峰值临时空间可能接近最终归档体积的两倍；多卷最终提交遇到一般错误会回滚，但系统崩溃时多文件名无法作为一个原子事务提交。
 - 归档已在本机用官方 7-Zip 26.05 验证小卷互操作及 2,000,000,001 字节单文件的测试、提取和 SHA-256；未在 Windows、macOS Intel 或干净系统上做同等验收。程序内没有“恢复到隔离目录”的单独严格校验模式。

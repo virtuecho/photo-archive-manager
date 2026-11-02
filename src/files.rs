@@ -41,6 +41,7 @@ pub fn copy_verified(
     source: impl AsRef<Path>,
     destination: impl AsRef<Path>,
     expected_source: Option<FileStamp>,
+    expected_sha256: Option<&str>,
 ) -> io::Result<CopyReceipt> {
     let source = source.as_ref();
     let destination = destination.as_ref();
@@ -111,6 +112,15 @@ pub fn copy_verified(
         ));
     }
     let source_sha256 = to_hex(&hasher.finalize());
+    if expected_sha256.is_some_and(|expected| expected != source_sha256) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source no longer matches the final manifest: {}",
+                source.display()
+            ),
+        ));
+    }
     let destination_sha256 = sha256_file(&partial_path)?;
     if source_sha256 != destination_sha256 {
         return Err(io::Error::new(
@@ -292,7 +302,7 @@ mod tests {
         let source_metadata = fs::metadata(&source).unwrap();
         let expected = stamp(&source_metadata);
 
-        let receipt = copy_verified(&source, &destination, Some(expected)).unwrap();
+        let receipt = copy_verified(&source, &destination, Some(expected), None).unwrap();
         assert_eq!(receipt.size, expected.size);
         assert_eq!(receipt.source_sha256, receipt.destination_sha256);
         assert_eq!(
@@ -301,7 +311,7 @@ mod tests {
         );
         assert!(verify_pair(&source, &destination).unwrap().matches);
         assert_eq!(
-            copy_verified(&source, &destination, Some(expected))
+            copy_verified(&source, &destination, Some(expected), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
@@ -316,7 +326,7 @@ mod tests {
         let source = root.join("source.jpg");
         let destination = root.join("destination.jpg");
         fs::write(&source, b"photo bytes").unwrap();
-        copy_verified(&source, &destination, None).unwrap();
+        copy_verified(&source, &destination, None, None).unwrap();
 
         let mut changed = OpenOptions::new().write(true).open(&destination).unwrap();
         changed.seek(SeekFrom::Start(0)).unwrap();
@@ -340,12 +350,29 @@ mod tests {
         fs::write(&source, b"different size").unwrap();
 
         assert_eq!(
-            copy_verified(&source, root.join("copy.jpg"), Some(expected))
+            copy_verified(&source, root.join("copy.jpg"), Some(expected), None)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn copy_rejects_content_that_no_longer_matches_the_final_manifest() {
+        let root = temp_dir();
+        let source = root.join("source.jpg");
+        let destination = root.join("copy.jpg");
+        fs::write(&source, b"approved bytes").unwrap();
+        let approved_sha256 = to_hex(&Sha256::digest(b"approved bytes"));
+        fs::write(&source, b"changed bytes").unwrap();
+
+        let error = copy_verified(&source, &destination, None, Some(&approved_sha256)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("final manifest"));
+        assert!(!destination.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

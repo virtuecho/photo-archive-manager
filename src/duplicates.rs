@@ -37,6 +37,7 @@ pub struct DuplicateReport {
     pub exact_groups: Vec<ExactDuplicateGroup>,
     pub time_candidates: Vec<TimeCandidate>,
     pub hash_errors: Vec<(PathBuf, String)>,
+    pub file_sha256: BTreeMap<PathBuf, String>,
     pub unknown_timezone_count: usize,
     pub different_device_pairs_skipped: usize,
     pub time_candidates_truncated: bool,
@@ -70,6 +71,9 @@ where
                     .entry(sha256.clone())
                     .or_default()
                     .push(record.path.clone());
+                report
+                    .file_sha256
+                    .insert(record.path.clone(), sha256.clone());
                 hashed.push(HashedFile {
                     metadata: record,
                     sha256,
@@ -371,6 +375,7 @@ mod tests {
         assert!(!cancelled);
         assert_eq!(report.exact_groups.len(), 1);
         assert_eq!(report.exact_groups[0].paths, [first, second]);
+        assert_eq!(report.file_sha256.len(), 2);
         assert!(report.time_candidates.is_empty());
         fs::remove_dir_all(root).unwrap();
     }

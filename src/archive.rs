@@ -167,6 +167,7 @@ pub fn create_and_verify(
     password: &str,
     max_bytes: u64,
     excluded_paths: &BTreeSet<PathBuf>,
+    included_sha256: Option<&BTreeMap<PathBuf, String>>,
     cancel: &AtomicBool,
     mut progress: impl FnMut(usize, usize, u64),
 ) -> Result<ArchiveResult, String> {
@@ -182,6 +183,17 @@ pub fn create_and_verify(
         .iter()
         .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
         .collect::<BTreeSet<_>>();
+    let included_sha256 = included_sha256.map(|entries| {
+        entries
+            .iter()
+            .map(|(path, sha256)| {
+                (
+                    fs::canonicalize(path).unwrap_or_else(|_| path.clone()),
+                    sha256.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    });
     if !source.is_dir() || !output_directory.is_dir() {
         return Err("归档来源和输出位置都必须是现有文件夹。".into());
     }
@@ -233,6 +245,32 @@ pub fn create_and_verify(
                 .unwrap_or("未提供")
         ));
     }
+    let expected_manifest_paths = included_sha256.as_ref().map(|entries| {
+        entries
+            .keys()
+            .filter(|path| path.starts_with(&source))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    });
+    if expected_manifest_paths
+        .as_ref()
+        .is_some_and(BTreeSet::is_empty)
+    {
+        return Err("最终清单中没有当前归档来源下的已确认文件。".into());
+    }
+    if let Some(expected_paths) = &expected_manifest_paths {
+        let current_paths = summary
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        let missing = expected_paths.difference(&current_paths).count();
+        if missing > 0 {
+            return Err(format!(
+                "最终清单中有 {missing} 个文件已不存在或无法读取；请重新执行重复检查。"
+            ));
+        }
+    }
     let top_name = source
         .file_name()
         .and_then(|name| name.to_str())
@@ -240,7 +278,12 @@ pub fn create_and_verify(
     let files = summary
         .files
         .iter()
-        .filter(|file| !excluded_paths.contains(&file.path))
+        .filter(|file| {
+            !excluded_paths.contains(&file.path)
+                && included_sha256
+                    .as_ref()
+                    .is_none_or(|entries| entries.contains_key(&file.path))
+        })
         .map(|file| ManifestFile {
             path: &file.path,
             relative: &file.relative_path,
@@ -281,6 +324,16 @@ pub fn create_and_verify(
         }
         let sha256 = files::sha256_file(file.path)
             .map_err(|error| format!("无法计算来源 SHA-256 {}：{error}", file.path.display()))?;
+        if included_sha256
+            .as_ref()
+            .and_then(|entries| entries.get(file.path))
+            .is_some_and(|expected| expected != &sha256)
+        {
+            return Err(format!(
+                "来源内容与阶段⑥ Final Manifest 的 SHA-256 不符：{}；请重新检查重复项。",
+                file.path.display()
+            ));
+        }
         let after = fs::metadata(file.path)
             .map_err(|error| format!("无法重新读取来源 {}：{error}", file.path.display()))?;
         if after.len() != before.len() || after.modified().ok() != before.modified().ok() {
@@ -395,7 +448,12 @@ pub fn create_and_verify(
     let final_files = final_scan
         .files
         .iter()
-        .filter(|file| !excluded_paths.contains(&file.path))
+        .filter(|file| {
+            !excluded_paths.contains(&file.path)
+                && included_sha256
+                    .as_ref()
+                    .is_none_or(|entries| entries.contains_key(&file.path))
+        })
         .collect::<Vec<_>>();
     if final_scan.error_count > 0
         || final_files.len() != files.len()
@@ -807,6 +865,7 @@ mod tests {
             "中文-password",
             2_000_000_000,
             &BTreeSet::new(),
+            None,
             &AtomicBool::new(false),
             |_, _, _| {},
         )
@@ -845,6 +904,7 @@ mod tests {
             "pw",
             2_000_000_000,
             &BTreeSet::new(),
+            None,
             &AtomicBool::new(false),
             |_, _, _| {},
         )
@@ -858,6 +918,7 @@ mod tests {
             "pw",
             2_000_000_000,
             &BTreeSet::new(),
+            None,
             &AtomicBool::new(false),
             |_, _, _| {},
         )
@@ -885,12 +946,75 @@ mod tests {
             "pw",
             2_000_000_000,
             &excluded,
+            None,
             &AtomicBool::new(false),
             |_, _, _| {},
         )
         .unwrap();
         assert_eq!(result.file_count, 1);
         assert_eq!(result.total_bytes, 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_uses_only_final_manifest_files_and_rejects_changed_or_missing_content() {
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let approved = source.join("approved.jpg");
+        let unreviewed = source.join("unreviewed.jpg");
+        fs::write(&approved, b"approved bytes").unwrap();
+        fs::write(&unreviewed, b"new file not in the reviewed set").unwrap();
+        let final_manifest = BTreeMap::from([(
+            fs::canonicalize(&approved).unwrap(),
+            files::sha256_file(&approved).unwrap(),
+        )]);
+
+        let result = create_and_verify(
+            &source,
+            &output,
+            "reviewed.7z",
+            "pw",
+            2_000_000_000,
+            &BTreeSet::new(),
+            Some(&final_manifest),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert_eq!(result.file_count, 1);
+
+        fs::write(&approved, b"changed after review").unwrap();
+        let changed_error = create_and_verify(
+            &source,
+            &output,
+            "changed.7z",
+            "pw",
+            2_000_000_000,
+            &BTreeSet::new(),
+            Some(&final_manifest),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(changed_error.contains("Final Manifest"));
+
+        fs::remove_file(&approved).unwrap();
+        let missing_error = create_and_verify(
+            &source,
+            &output,
+            "missing.7z",
+            "pw",
+            2_000_000_000,
+            &BTreeSet::new(),
+            Some(&final_manifest),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(missing_error.contains("已不存在"), "{missing_error}");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -910,6 +1034,7 @@ mod tests {
             "中文-password",
             100,
             &BTreeSet::new(),
+            None,
             &AtomicBool::new(false),
             |_, _, _| {},
         )
@@ -961,6 +1086,7 @@ mod tests {
             "中文-password",
             VOLUME_BYTES,
             &BTreeSet::new(),
+            None,
             &AtomicBool::new(false),
             |_, _, _| {},
         )

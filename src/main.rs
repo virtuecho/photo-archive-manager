@@ -208,6 +208,22 @@ struct PreviewPixels {
     image: image::RgbaImage,
 }
 
+#[derive(Clone, Debug)]
+struct FinalManifest {
+    root: PathBuf,
+    file_sha256: BTreeMap<PathBuf, String>,
+}
+
+impl FinalManifest {
+    fn applies_to(&self, source: &Path) -> bool {
+        source.starts_with(&self.root) || self.root.starts_with(source)
+    }
+
+    fn sha256_for(&self, path: &Path) -> Option<&str> {
+        self.file_sha256.get(path).map(String::as_str)
+    }
+}
+
 impl Default for ArchiveOptions {
     fn default() -> Self {
         Self { volume_mb: 2000 }
@@ -239,6 +255,7 @@ struct PhotoArchiveApp {
     duplicate_options: DuplicateOptions,
     duplicate_report: Option<duplicates::DuplicateReport>,
     excluded_final_paths: std::collections::BTreeSet<PathBuf>,
+    final_manifest: Option<FinalManifest>,
     candidate_preview_paths: Option<(PathBuf, PathBuf)>,
     candidate_preview_receiver:
         Option<Receiver<(Result<PreviewPixels, String>, Result<PreviewPixels, String>)>>,
@@ -1028,6 +1045,7 @@ impl PhotoArchiveApp {
                             self.duplicate_directory = Some(path);
                             self.duplicate_report = None;
                             self.excluded_final_paths.clear();
+                            self.final_manifest = None;
                             self.clear_candidate_preview();
                         }
                         Err(error) => {
@@ -1216,6 +1234,13 @@ impl PhotoArchiveApp {
             ui.weak(format!(
                 "本次会话携带 {} 个阶段⑥排除标记；路径完全匹配的文件将从备份清单排除。",
                 self.excluded_final_paths.len()
+            ));
+        }
+        if let Some(manifest) = &self.final_manifest {
+            ui.weak(format!(
+                "已携带阶段⑥ Final Manifest：{} 个文件；与 {} 重叠的备份来源只处理这些已确认路径并核对 SHA-256。",
+                manifest.file_sha256.len(),
+                manifest.root.display()
             ));
         }
         if ui
@@ -1489,6 +1514,14 @@ impl PhotoArchiveApp {
                 self.excluded_final_paths.len()
             ));
         }
+        if let (Some(source), Some(manifest)) = (&self.archive_source, self.final_manifest.as_ref())
+            && manifest.applies_to(source)
+        {
+            ui.weak(format!(
+                "已携带阶段⑥ Final Manifest：只归档其中 {} 个已确认文件，并核对其 SHA-256。",
+                manifest.file_sha256.len()
+            ));
+        }
         ui.horizontal(|ui| {
             ui.label("密码");
             ui.add(
@@ -1560,6 +1593,11 @@ impl PhotoArchiveApp {
         let name = self.archive_name.trim().to_string();
         let max_bytes = u64::from(self.archive_options.volume_mb) * 1_000_000;
         let excluded_paths = self.excluded_final_paths.clone();
+        let included_sha256 = self
+            .final_manifest
+            .as_ref()
+            .filter(|manifest| manifest.applies_to(&source))
+            .map(|manifest| manifest.file_sha256.clone());
         let mut password = std::mem::take(&mut self.archive_password);
         self.archive_confirmation.zeroize();
         self.archive_show_password = false;
@@ -1582,6 +1620,7 @@ impl PhotoArchiveApp {
                 &password,
                 max_bytes,
                 &excluded_paths,
+                included_sha256.as_ref(),
                 &worker_cancel,
                 |completed, total, bytes| {
                     let _ = sender.send(WorkMessage::ArchiveProgress {
@@ -1624,6 +1663,7 @@ impl PhotoArchiveApp {
             "正在扫描本地整理目录并准备独立备份目标…".into()
         };
         let excluded = self.excluded_final_paths.clone();
+        let final_manifest = self.final_manifest.clone();
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
@@ -1635,6 +1675,7 @@ impl PhotoArchiveApp {
                 BTreeMap::<PathBuf, (PathBuf, std::collections::BTreeSet<PathBuf>)>::new();
             let mut error = None;
             let mut excluded_count = 0usize;
+            let mut manifest_filtered_count = 0usize;
             for mapping in mappings {
                 if worker_cancel.load(Ordering::Relaxed) {
                     let _ = sender.send(WorkMessage::BackupComplete {
@@ -1649,6 +1690,9 @@ impl PhotoArchiveApp {
                 let Some(source) = mapping.source else {
                     continue;
                 };
+                let scoped_manifest = final_manifest
+                    .as_ref()
+                    .filter(|manifest| manifest.applies_to(&source));
                 let summary =
                     match scan_sources(std::slice::from_ref(&source), &worker_cancel, |_| {}) {
                         Ok(summary) => summary,
@@ -1664,18 +1708,45 @@ impl PhotoArchiveApp {
                         }
                     };
                 if summary.error_count > 0 {
-                    error = Some(format!(
-                        "扫描 {} 时有 {} 项读取错误（例如 {}）",
-                        source.display(),
-                        summary.error_count,
-                        summary
-                            .error_samples
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or("未提供")
-                    ));
+                    append_task_error(
+                        &mut error,
+                        format!(
+                            "扫描 {} 时有 {} 项读取错误（例如 {}）",
+                            source.display(),
+                            summary.error_count,
+                            summary
+                                .error_samples
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("未提供")
+                        ),
+                    );
+                }
+                if let Some(manifest) = scoped_manifest {
+                    let actual_paths = summary
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let missing = manifest
+                        .file_sha256
+                        .keys()
+                        .filter(|path| path.starts_with(&source) && !actual_paths.contains(*path))
+                        .count();
+                    if missing > 0 {
+                        append_task_error(
+                            &mut error,
+                            format!("最终清单中有 {missing} 个文件已不存在或无法扫描"),
+                        );
+                    }
                 }
                 for file in summary.files {
+                    let expected_sha256 =
+                        scoped_manifest.and_then(|manifest| manifest.sha256_for(&file.path));
+                    if scoped_manifest.is_some() && expected_sha256.is_none() {
+                        manifest_filtered_count += mapping.targets.len();
+                        continue;
+                    }
                     if excluded.contains(&file.path) {
                         excluded_count += mapping.targets.len();
                         continue;
@@ -1693,6 +1764,7 @@ impl PhotoArchiveApp {
                                 size: file.size,
                                 modified: file.modified,
                             },
+                            expected_sha256: expected_sha256.map(str::to_string),
                         });
                     }
                 }
@@ -1704,27 +1776,39 @@ impl PhotoArchiveApp {
                     cancelled: false,
                     error: Some(match error {
                         Some(error) => format!("{error}；没有可备份文件。"),
-                        None => "没有可备份文件；请检查来源目录和阶段⑥排除标记。".into(),
+                        None => "没有可备份文件；请检查来源目录、最终清单和阶段⑥排除标记。".into(),
                     }),
                     verify_only,
                 });
                 return;
             }
             if excluded_count > 0 {
-                error = Some(match error {
-                    Some(error) => {
-                        format!("{error}；按阶段⑥决定排除了 {excluded_count} 个目标文件项。")
-                    }
-                    None => format!("按阶段⑥决定排除了 {excluded_count} 个目标文件项。"),
-                });
+                append_task_error(
+                    &mut error,
+                    format!("按阶段⑥决定排除了 {excluded_count} 个目标文件项"),
+                );
+            }
+            if manifest_filtered_count > 0 {
+                append_task_error(
+                    &mut error,
+                    format!("最终清单之外的 {manifest_filtered_count} 个目标文件项未备份"),
+                );
             }
             let item_count = items.len();
             if verify_only {
+                let expected_sha256 = items
+                    .iter()
+                    .filter_map(|item| {
+                        item.expected_sha256
+                            .as_ref()
+                            .map(|sha256| (item.source.clone(), sha256.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
                 let pairs = items
                     .into_iter()
                     .map(|item| (item.source, item.destination))
                     .collect::<Vec<_>>();
-                let (verification, cancelled) =
+                let (mut verification, cancelled) =
                     pipeline::verify_batch(pairs, &worker_cancel, |completed, total| {
                         let _ = sender.send(WorkMessage::BackupProgress {
                             completed,
@@ -1732,6 +1816,17 @@ impl PhotoArchiveApp {
                             bytes: 0,
                         });
                     });
+                for item in &mut verification {
+                    let changed = expected_sha256.get(&item.source).is_some_and(|expected| {
+                        item.result
+                            .as_ref()
+                            .is_ok_and(|result| &result.source_sha256 != expected)
+                    });
+                    if changed {
+                        item.result =
+                            Err("源文件 SHA-256 与阶段⑥最终清单不符；请重新检查重复项。".into());
+                    }
+                }
                 let mut verification = verification;
                 let (extra_results, target_error) =
                     inspect_backup_targets(&expected_by_target, &worker_cancel);
@@ -1803,6 +1898,7 @@ impl PhotoArchiveApp {
         };
         self.duplicate_report = None;
         self.excluded_final_paths.clear();
+        self.final_manifest = None;
         self.clear_candidate_preview();
         self.work_completed = 0;
         self.work_total = 0;
@@ -2118,6 +2214,7 @@ impl PhotoArchiveApp {
                     size: file.size,
                     modified: file.modified,
                 },
+                expected_sha256: None,
             });
         }
         plan
@@ -2489,7 +2586,7 @@ impl PhotoArchiveApp {
                         );
                         self.handoff_title = "重复检查已完成".into();
                         self.handoff_description = format!(
-                            "本轮重新扫描并检查了目录。发现 {} 个字节完全相同组、{} 个时间候选、{} 个 SHA-256 读取错误。当前人工排除标记共 {} 项；只影响本次会话，不会删除磁盘文件。{}",
+                            "本轮重新扫描并检查了目录。发现 {} 个字节完全相同组、{} 个时间候选、{} 个 SHA-256 读取错误。携带时会将成功计算 SHA-256 且未排除的路径组成仅保存在本次会话内存中的 Final Manifest，阶段⑦/⑧对重叠来源只处理其中路径并复核哈希。当前人工排除标记共 {} 项；只影响本次会话，不会删除磁盘文件。{}",
                             exact_groups,
                             candidates,
                             hash_errors,
@@ -2749,6 +2846,7 @@ impl PhotoArchiveApp {
         self.scan_receiver = Some(receiver);
         self.cancel_scan = Some(cancel);
         self.scanning = true;
+        self.final_manifest = None;
         self.scan_progress = ScanProgress::default();
         self.last_scan = None;
         self.status = "正在读取目录清单…".into();
@@ -2867,6 +2965,20 @@ impl PhotoArchiveApp {
         match action {
             Some(0) => {
                 self.show_handoff = false;
+                if self.stage == 5
+                    && let (Some(root), Some(report)) = (
+                        self.duplicate_directory.clone(),
+                        self.duplicate_report.as_ref(),
+                    )
+                {
+                    let file_sha256 = report
+                        .file_sha256
+                        .iter()
+                        .filter(|(path, _)| !self.excluded_final_paths.contains(*path))
+                        .map(|(path, sha256)| (path.clone(), sha256.clone()))
+                        .collect();
+                    self.final_manifest = Some(FinalManifest { root, file_sha256 });
+                }
                 self.stage = (self.stage + 1).min(STAGES.len() - 1);
             }
             Some(1) => {
@@ -2882,6 +2994,7 @@ impl PhotoArchiveApp {
                 self.metadata_results.clear();
                 self.duplicate_report = None;
                 self.excluded_final_paths.clear();
+                self.final_manifest = None;
                 self.backup_mappings.clear();
                 self.backup_copies.clear();
                 self.backup_verification.clear();
@@ -3082,6 +3195,14 @@ fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
         }
     }
     errors.into_iter().collect()
+}
+
+fn append_task_error(error: &mut Option<String>, message: impl Into<String>) {
+    let message = message.into();
+    *error = Some(match error.take() {
+        Some(existing) => format!("{existing}；{message}"),
+        None => message,
+    });
 }
 
 fn inspect_backup_targets(
@@ -3537,6 +3658,7 @@ mod tests {
                             size: file.size,
                             modified: file.modified,
                         },
+                        expected_sha256: None,
                     })
             })
             .collect();
