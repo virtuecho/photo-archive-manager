@@ -92,7 +92,10 @@ fn read_pending_archive_from(path: &Path) -> io::Result<Option<SavedArchivePlan>
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "归档任务检查点必须是普通文件",
+            crate::i18n::text(
+                "Archive checkpoint must be a regular file",
+                "归档任务检查点必须是普通文件",
+            ),
         ));
     }
     #[cfg(unix)]
@@ -106,7 +109,10 @@ fn read_pending_archive_from(path: &Path) -> io::Result<Option<SavedArchivePlan>
     if checkpoint.version != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "不支持的归档任务检查点版本",
+            crate::i18n::text(
+                "Unsupported archive checkpoint version",
+                "不支持的归档任务检查点版本",
+            ),
         ));
     }
     validate_pending_archive(&checkpoint.plan)?;
@@ -127,7 +133,10 @@ fn validate_pending_archive(plan: &SavedArchivePlan) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "归档任务来源、输出目录、名称或分卷大小无效",
+            crate::i18n::text(
+                "Archive task source, output folder, name, or volume size is invalid",
+                "归档任务来源、输出目录、名称或分卷大小无效",
+            ),
         ));
     }
     Ok(())
@@ -172,7 +181,10 @@ fn read_pending_backup_from(path: &Path) -> io::Result<Option<Vec<SavedBackupMap
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "备份任务检查点必须是普通文件",
+            crate::i18n::text(
+                "Backup checkpoint must be a regular file",
+                "备份任务检查点必须是普通文件",
+            ),
         ));
     }
     #[cfg(unix)]
@@ -186,7 +198,10 @@ fn read_pending_backup_from(path: &Path) -> io::Result<Option<Vec<SavedBackupMap
     if checkpoint.version != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "不支持的备份任务检查点版本",
+            crate::i18n::text(
+                "Unsupported backup checkpoint version",
+                "不支持的备份任务检查点版本",
+            ),
         ));
     }
     validate_pending_backup(&checkpoint.mappings)?;
@@ -197,7 +212,7 @@ fn validate_pending_backup(mappings: &[SavedBackupMapping]) -> io::Result<()> {
     if mappings.is_empty() || mappings.len() > 1_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "备份任务映射数量无效",
+            crate::i18n::text("Invalid number of backup mappings", "备份任务映射数量无效"),
         ));
     }
     let mut sources = BTreeSet::new();
@@ -209,7 +224,10 @@ fn validate_pending_backup(mappings: &[SavedBackupMapping]) -> io::Result<()> {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "备份任务来源或目标数量无效",
+                crate::i18n::text(
+                    "Invalid number of backup sources or destinations",
+                    "备份任务来源或目标数量无效",
+                ),
             ));
         }
         let mut targets = BTreeSet::new();
@@ -220,7 +238,10 @@ fn validate_pending_backup(mappings: &[SavedBackupMapping]) -> io::Result<()> {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "备份任务目标路径无效或重复",
+                crate::i18n::text(
+                    "Backup destination path is invalid or duplicated",
+                    "备份任务目标路径无效或重复",
+                ),
             ));
         }
     }
@@ -266,7 +287,10 @@ fn read_pending_copy_from(path: &Path) -> io::Result<Option<Vec<SavedCopyItem>>>
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "复制任务检查点必须是普通文件",
+            crate::i18n::text(
+                "Copy checkpoint must be a regular file",
+                "复制任务检查点必须是普通文件",
+            ),
         ));
     }
     #[cfg(unix)]
@@ -284,7 +308,10 @@ fn read_pending_copy_from(path: &Path) -> io::Result<Option<Vec<SavedCopyItem>>>
     if checkpoint.version != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "不支持的复制任务检查点版本",
+            crate::i18n::text(
+                "Unsupported copy checkpoint version",
+                "不支持的复制任务检查点版本",
+            ),
         ));
     }
     validate_pending_copy(&checkpoint.items)?;
@@ -295,7 +322,7 @@ fn validate_pending_copy(items: &[SavedCopyItem]) -> io::Result<()> {
     if items.is_empty() || items.len() > 1_000_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "复制任务文件数无效",
+            crate::i18n::text("Invalid number of copy task files", "复制任务文件数无效"),
         ));
     }
     let mut destinations = BTreeSet::new();
@@ -314,7 +341,10 @@ fn validate_pending_copy(items: &[SavedCopyItem]) -> io::Result<()> {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "复制任务路径、时间戳或 SHA-256 无效",
+                crate::i18n::text(
+                    "Copy task path, timestamp, or SHA-256 is invalid",
+                    "复制任务路径、时间戳或 SHA-256 无效",
+                ),
             ));
         }
     }
@@ -385,14 +415,25 @@ fn checkpoint_dir() -> io::Result<PathBuf> {
     let base = env::var_os("HOME").map(PathBuf::from);
 
     base.map(|path| path.join("PhotoArchiveManager"))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "应用私有数据目录不可用"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                crate::i18n::text("App data folder is unavailable", "应用私有数据目录不可用"),
+            )
+        })
 }
 
 fn write_to(path: &Path, review: &SavedReview) -> io::Result<()> {
     validate(review)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "检查点路径没有父目录"))?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::i18n::text(
+                "Checkpoint path has no parent folder",
+                "检查点路径没有父目录",
+            ),
+        )
+    })?;
     create_private_dir(parent)?;
 
     let files = review
@@ -422,9 +463,15 @@ fn write_to(path: &Path, review: &SavedReview) -> io::Result<()> {
 }
 
 fn write_json_atomically(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "检查点路径没有父目录"))?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::i18n::text(
+                "Checkpoint path has no parent folder",
+                "检查点路径没有父目录",
+            ),
+        )
+    })?;
     create_private_dir(parent)?;
     let data = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     write_data_atomically(parent, path, &data)
@@ -479,7 +526,7 @@ fn read_from(path: &Path) -> io::Result<Option<SavedReview>> {
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "检查点必须是普通文件",
+            crate::i18n::text("Checkpoint must be a regular file", "检查点必须是普通文件"),
         ));
     }
     if let Some(parent) = path.parent() {
@@ -499,47 +546,80 @@ fn read_from(path: &Path) -> io::Result<Option<SavedReview>> {
     if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "不支持的检查点版本",
+            crate::i18n::text("Unsupported checkpoint version", "不支持的检查点版本"),
         ));
     }
     let root = value
         .get("root")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "检查点缺少来源目录"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::i18n::text(
+                    "Checkpoint is missing its source folder",
+                    "检查点缺少来源目录",
+                ),
+            )
+        })?;
     let mut file_sha256 = BTreeMap::new();
     for entry in value
         .get("files")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "检查点文件清单格式错误"))?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::i18n::text(
+                    "Checkpoint file manifest has an invalid format",
+                    "检查点文件清单格式错误",
+                ),
+            )
+        })?
     {
         let path = entry
             .get("path")
             .and_then(serde_json::Value::as_str)
             .map(PathBuf::from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "检查点文件路径缺失"))?;
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    crate::i18n::text("Checkpoint is missing a file path", "检查点文件路径缺失"),
+                )
+            })?;
         let sha256 = entry
             .get("sha256")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "检查点哈希缺失"))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    crate::i18n::text("Checkpoint is missing a hash", "检查点哈希缺失"),
+                )
+            })?
             .to_ascii_lowercase();
         if file_sha256.insert(path, sha256).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "检查点含重复路径",
+                crate::i18n::text("Checkpoint contains duplicate paths", "检查点含重复路径"),
             ));
         }
     }
     let excluded_paths = value
         .get("excluded_paths")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "排除记录格式错误"))?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::i18n::text("Exclusion record has an invalid format", "排除记录格式错误"),
+            )
+        })?
         .iter()
         .map(|entry| {
-            entry
-                .as_str()
-                .map(PathBuf::from)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "排除路径格式错误"))
+            entry.as_str().map(PathBuf::from).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    crate::i18n::text("Exclusion path has an invalid format", "排除路径格式错误"),
+                )
+            })
         })
         .collect::<io::Result<BTreeSet<_>>>()?;
     let review = SavedReview {
@@ -555,7 +635,10 @@ fn validate(review: &SavedReview) -> io::Result<()> {
     if !review.root.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "检查点来源目录不是绝对路径",
+            crate::i18n::text(
+                "Checkpoint source folder is not an absolute path",
+                "检查点来源目录不是绝对路径",
+            ),
         ));
     }
     for (path, sha256) in &review.file_sha256 {
@@ -566,7 +649,10 @@ fn validate(review: &SavedReview) -> io::Result<()> {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "检查点文件或 SHA-256 无效",
+                crate::i18n::text(
+                    "Checkpoint file or SHA-256 is invalid",
+                    "检查点文件或 SHA-256 无效",
+                ),
             ));
         }
     }
@@ -577,7 +663,10 @@ fn validate(review: &SavedReview) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "检查点排除路径越出来源目录",
+            crate::i18n::text(
+                "Checkpoint exclusion path is outside the source folder",
+                "检查点排除路径越出来源目录",
+            ),
         ));
     }
     Ok(())

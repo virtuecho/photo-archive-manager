@@ -1,95 +1,71 @@
-# 干净环境验收清单
+# Clean-machine acceptance checklist
 
-本清单用于准备发布候选版后的 Windows/macOS 离线验收。每次执行都记录日期、系统版本、机器架构、提交号、产物 SHA-256、是否断网，以及通过/失败和证据路径。交叉编译、开发机测试或本清单本身都不代表干净机器验收已通过。
+**English | [简体中文](acceptance-checklist.zh-CN.md)**
 
-## 当前可用产物与验证边界
+Use this checklist for each release candidate. Record actual results and evidence; a cross-build, development-machine run, or unchecked box is not clean-machine acceptance. Do not place real GPS data or passwords in shared evidence.
 
-- macOS arm64 开发构建：`target/aarch64-apple-darwin/release/photo-archive-manager`。本机 arm64 已运行验证；该文件尚未签名、公证，也不是 `.app` 发布包。
-- Windows x86_64 开发构建：`target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe`。已从 macOS 交叉编译；Windows 实机启动和离线验收尚未完成。
-- macOS Intel 开发构建：`target/x86_64-apple-darwin/release/photo-archive-manager`。Intel 目标应用已在 Rosetta 下通过嵌入 ExifTool 运行用例；Intel 实机和干净机器离线验收仍待完成。
-- 目前 HEIC/HEIF 覆盖由程序生成的样本完成；真实相机/手机样本仍待验收。
+## Acceptance record
 
-## 验收记录
-
-| 字段 | 记录 |
+| Field | Record |
 | --- | --- |
-| 日期 / 执行人 |  |
-| Git 提交 |  |
-| 系统版本 / 架构 |  |
-| 产物路径 / SHA-256 |  |
-| 干净 VM 或机器 |  |
-| 断网状态 |  |
-| 结果 / 证据目录 |  |
+| Date / operator |  |
+| Git revision |  |
+| OS version / architecture |  |
+| ZIP filename / SHA-256 |  |
+| Clean machine or VM |  |
+| Network disconnected |  |
+| Result / evidence location |  |
 
-## 发布前准备
+## Package and launch
 
-- [ ] 使用准备交付的单个文件；记录 `shasum -a 256 <产物>`，确认产物来自本次提交。
-- [ ] 在未安装 Rust、Python、Perl、ExifTool、7-Zip、HEIF 扩展和额外运行时的干净系统中运行。
-- [ ] 断开网络后冷启动，再关闭并重新启动一次；两次都不得尝试下载依赖。
-- [ ] 确认启动、文件夹选择和开源许可界面工作；查看进程列表，确认没有由应用启动的未打包辅助工具。
-- [ ] 保留应用日志、截图、输入样本清单、归档测试记录和 SHA-256；不得把真实 GPS 或密码写入共享证据。
+- [ ] Build the packages from the intended revision; confirm the three ZIP filenames identify version, platform, and architecture and that `SHA256SUMS.txt` matches them.
+- [ ] On a clean, offline system without Rust, Python, Perl, ExifTool, 7-Zip, HEIF extensions, or extra runtimes installed, extract and launch the matching package.
+- [ ] For macOS, launch `Photo Archive Manager.app` from Finder; check the file picker, Dock, permissions, signing, notarization, and Gatekeeper behavior.
+- [ ] For Windows, launch the GUI executable and verify startup and embedded ExifTool extraction without installing additional runtimes.
+- [ ] Confirm the first-run interface is English; switch to Chinese and back while the app is open, then restart and verify the selected language is remembered.
+- [ ] Confirm the bilingual quick-start, technical pages, and third-party notices are included and their language links work.
 
-## 通用文件处理
+## Scan, organization, and verification
 
-- [ ] 选择两个有父子目录关系的来源目录，确认没有重复扫描同一真实文件；测试符号链接循环不会无限遍历。
-- [ ] 路由 `HEIC + MOV + JPG` 到同一 `Photos/`，并把 RAW 路由到另一目标；确认不自动创建 `VIDEO/`，同名不同内容不被覆盖。
-- [ ] 验证 `.DS_Store`、`._IMG.HEIC`、`Thumbs.db`、`desktop.ini` 的过滤记录；恢复包含选项后确认文件能进入清单；`.XMP`、`.AAE` 和普通隐藏文件必须保留。
-- [ ] 复制前后比较来源文件清单和哈希，确认来源内容没有被修改。
-- [ ] 人为改写已复制目标的一个字节但保持文件大小不变；完整性校验必须报告 SHA-256 不匹配。恢复正确内容后只复查异常项，确认本轮状态恢复 PASS。
-- [ ] 运行阶段任务时切换阶段，分别选择继续、暂停后切换、取消后切换；暂停后切换应等到当前文件/扫描条目结束，任务保持暂停并可从底栏恢复；等待期间取消切换应恢复原任务。
-- [ ] 在②配置部分或全部扩展名映射，选择“完成分类设置”；交接内容应列出路由和未映射扩展名，携带后阶段③仍使用这些路由，不携带后应要求重新选择输入。
-- [ ] 让阶段③复制和阶段⑦备份在文件间暂停、恢复和取消；强制退出后重启，确认阶段③提示恢复计划、阶段⑦恢复映射并重新扫描来源，已提交目标均重验，冲突目标不覆盖。对其他阶段强制退出后确认没有被误报 PASS，并记录尚不支持的恢复范围。
+- [ ] Scan parent and child folders together; confirm files are not counted twice and symbolic-link loops are not followed.
+- [ ] Route HEIC, MOV, and JPEG to one folder and RAW to another; check unmapped types are reported and same-name destination files are not overwritten.
+- [ ] Confirm default system-file exclusions and the option to include them; regular hidden files and sidecars remain available.
+- [ ] Compare source file lists and hashes before and after organization to confirm originals were not changed.
+- [ ] Change one copied destination byte without changing its size; verification must report a SHA-256 mismatch. Restore it and rerun verification.
+- [ ] Pause, resume, cancel, and switch stages at safe boundaries; force-close during an organization copy and backup, then confirm only supported checkpoints are offered and existing outputs are revalidated.
 
-## 元数据与重复检查
+## Metadata and duplicate review
 
-- [ ] 选择包含 JPEG、HEIC/HEIF、支持的 RAW、MOV、中文及空格路径的样本目录，确认元数据结果来自当前文件读取。
-- [ ] 检查 GPS 的 VALID、MISSING、PARTIAL、INVALID、UNSUPPORTED、READ_ERROR 状态；`0,0` 不得只因坐标为零就判为无效。
-- [ ] 准备一张缺 GPS、但拍摄时间也仍缺失的样本，检查后在程序外补入有效 GPS，再完整重检；GPS 当前状态应显示有效并标记 `RESOLVED`，拍摄时间继续显示实际缺失状态。确认重检清除旧完整性/重复审核/备份结果，需重新运行相关阶段。
-- [ ] 接受一个仍有 MISSING/PARTIAL/INVALID/UNSUPPORTED 字段的文件警告；确认显示 `ACCEPTED` 但实际字段状态不变，改动字段状态并重新检查后接受标记消失，且与 `RESOLVED` 明确区分。
-- [ ] 通过可信原始拍摄时间检查阈值边界、无时区样本和不同设备；文件系统时间不得冒充拍摄时间。
-- [ ] 准备字节完全相同但名称不同的文件，确认报告精确重复但不自动删除；准备时间相近但图像明显不同的文件，确认仅进入候选并由用户审核。
-- [ ] 使用真实手机/相机 HEIC 和 HEIF 样本检查缩略预览、方向变换、pHash、色彩表现及大图解码限制；记录设备、格式和失败样本。程序当前将解码限制为 5000 万像素。
-- [ ] 排除某个候选后重启应用，确认审核决定恢复；修改排除后确认 Final Manifest 更新，旧备份校验结果清除。
+- [ ] Check GPS and capture-time states for valid, missing, partial, invalid, unsupported, and read-error samples; valid `0,0` coordinates must not be rejected solely for being zero.
+- [ ] Modify a missing metadata field outside the app and run a full recheck; confirm the changed field is marked `RESOLVED` and dependent earlier results need rechecking.
+- [ ] Acknowledge a readable warning; confirm it is marked `ACCEPTED` without changing the underlying field state, then change the file and confirm the acknowledgement clears.
+- [ ] Compare trusted capture times, timezone handling, and known different cameras; filesystem timestamps must not be presented as capture times.
+- [ ] Confirm byte-identical files are reported without deletion, while visual candidates remain reviewable and can be excluded.
+- [ ] Test real phone and camera HEIC/HEIF samples, orientation, previews, perceptual hashes, and the 50-megapixel decode limit.
+- [ ] Exclude a duplicate candidate, restart the app, and confirm the review decision is restored and changed decisions update the manifest.
 
-## 多目标备份
+## Backups and encrypted archives
 
-- [ ] 将 RAW、JPEG、HEIC 分别映射到不同目标，并为其中一个来源配置两个备份目标；每个目标都应显示独立结果并重新读取目标计算 SHA-256。
-- [ ] 测试一处目标不可写或中途断开，确认其他目标的结果保留，失败项路径和原因可见。
-- [ ] 测试源与目标完全相同、目标位于源内、源位于目标内；不得把同一路径报告为独立备份成功，也不得递归扫描备份副本。
-- [ ] 修改本地整理副本后重跑备份，确认新备份匹配当前本地内容，原始来源一致性结果仍标为需重新验证。
+- [ ] Back up one source to multiple targets; verify each target independently by rereading it and comparing SHA-256.
+- [ ] Test an unwritable or disconnected target; other target results remain visible and existing files are not overwritten.
+- [ ] Create an encrypted 7z archive with a confirmed password; verify that passwords are absent from logs and persistent checkpoints.
+- [ ] Test archive listing and extraction with an independent 7-Zip installation and confirm a wrong password cannot reveal encrypted names or contents.
+- [ ] Test small split volumes, a missing volume, and a file larger than 2,000,000,000 bytes; compare extracted and source SHA-256 values.
+- [ ] Exercise optional isolated restore verification; confirm restored files are reread and checked before commit and temporary data is removed.
+- [ ] Interrupt archive creation and restart; confirm recovery requires the password again and rebuilds from the beginning without overwriting existing output.
 
-## 加密归档
+## Platform results
 
-- [ ] 从阶段⑧直接选择任意目录开始；确认归档输入清单由当前目录重新扫描产生。
-- [ ] 使用两次输入的中文密码创建 Store、加密文件名的 `.7z`；错误或不一致密码必须阻止开始。检查密码未出现在参数、日志或持久检查点中。
-- [ ] 用独立 7-Zip 在另一台无开发工具的机器上测试归档、查看目录和提取；确认错误密码不能读取加密文件名或内容。
-- [ ] 确认归档中先出现唯一顶层来源文件夹，再出现照片；`HEIC/` 可同时含 HEIC 与 MOV。
-- [ ] 设小卷大小检查 `.7z.001/.002/...`、缺卷时报错、卷顺序和完整性；再用超过十进制 2,000,000,000 字节的单文件完成归档测试和提取，并比较输入/输出 SHA-256。
-- [ ] 让输出目录包含已有同名归档和不完整卷，确认不会静默覆盖；制造提交失败或中断，检查回滚与残留临时文件提示。
-- [ ] 勾选“隔离目录还原校验”创建归档；确认归档被写入临时隔离目录、每个还原文件从磁盘重读并通过 SHA-256，随后临时目录清理；检查空间不足或写入失败时不会提交最终归档，并记录清理失败路径。
-- [ ] 归档运行中强制结束应用并重启；确认恢复记录只包含来源、输出目录、归档名、卷大小、严格还原选项和审核清单指纹，不含密码、完整清单或旧 PASS；确认界面要求重新输入密码并重新扫描、从头重建。验证输入参数或审核清单变更会清除/作废旧记录，丢弃记录不会删除残留文件，已有输出会拒绝覆盖。
+### macOS Apple Silicon and Intel
 
-## 八阶段导航与状态失效
-
-- [ ] 直接进入⑤、⑦、⑧并只提供该阶段所需路径，确认每个阶段可独立运行。
-- [ ] 在每个阶段结束时检查四种交接选择和待传递信息；选择“不携带”后，下阶段不能预填上一阶段清单。
-- [ ] 在⑧完成归档后，保留结果或不携带结果都应回到①；不携带不得删除已生成的归档，停留和退出选择应保持各自行为。
-- [ ] 在程序外新增、移动、删除或修改文件，再执行完整重新扫描；当前结果必须反映文件系统现状，旧 PASS 不能覆盖新结果。
-- [ ] 外部修复一个缺 GPS 样本后重新检查；当前警告应消失并能区分已修复记录。检查依赖该文件的复制、备份和归档状态均需按需失效。
-- [ ] 确认取消流程不会删除来源或已提交的输出；错误必须包含具体路径和可理解原因。
-
-## 平台专项结果
+- [ ] Verify the correct architecture-specific `.app` opens on matching hardware with networking disabled.
+- [ ] Complete scan, metadata, duplicate review, backup, encrypted archive, and restore checks.
+- [ ] Run the Intel package on Intel hardware; a Rosetta check on Apple Silicon does not substitute for this step.
+- [ ] Complete signing, notarization, Finder, Dock, permissions, and Gatekeeper checks.
 
 ### Windows x86_64
 
-- [ ] 在断网的干净 Windows 机器启动单文件 EXE；不安装 Perl、ExifTool、7-Zip、HEIF 扩展或运行库。
-- [ ] 验证嵌入 ExifTool 解包、哈希/版本校验、中文/空格路径和 MOV/HEIC/RAW 元数据读取。
-- [ ] 验证内置 HEIC/HEIF 预览与 pHash、加密多卷 7z 创建及独立测试/提取。
-- [ ] 记录 SmartScreen、签名和 Gatekeeper 等系统信任提示；签名/发布流程完成后重新执行。
-
-### macOS arm64 / Intel
-
-- [ ] 在断网的干净 macOS arm64 机器运行单个发布文件，验证 ExifTool、元数据、HEIC/HEIF、备份和加密分卷归档。
-- [ ] 验证 Finder 启动、文件夹选择、Dock、签名、公证及 Gatekeeper；严格单文件目标和 `.app` bundle 的差异必须在发布说明中明确。
-- [ ] 使用 `scripts/build-macos-x86_64.sh` 产物，在断网的干净 macOS Intel 机器运行并完成相同验收；不得用 arm64 或 Rosetta 结果替代 Intel 实机结果。
-
+- [ ] Verify the package launches on clean Windows without Perl, ExifTool, 7-Zip, HEIF extensions, or extra runtimes installed.
+- [ ] Check embedded ExifTool extraction, hash/version verification, Unicode and spaced paths, plus metadata reads for common photo and video formats.
+- [ ] Complete preview, backup, encrypted-volume creation, independent archive test, and extraction checks.
+- [ ] Record Windows trust prompts and signing status.

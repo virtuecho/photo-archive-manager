@@ -1,5 +1,7 @@
 # ExifTool runtime payloads
 
+**English | [简体中文](THIRD_PARTY_NOTICES.zh-CN.md)**
+
 - ExifTool 13.60, Copyright 2003–2026 Phil Harvey.
 - Source archive: `Image-ExifTool-13.60.tar.gz` from the [official ExifTool SourceForge project](https://sourceforge.net/projects/exiftool/files/Image-ExifTool-13.60.tar.gz/download).
 - Source archive SHA-256: `c8e3c42576f46d862e4cd9c192989776e7363931e890c95056bcd6293e83ea36`.

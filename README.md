@@ -1,23 +1,29 @@
 # Photo Archive Manager
 
-Photo Archive Manager 是一款离线照片整理工具，帮助你检查照片、按规则分类、制作备份，并创建加密归档。
+**English | [简体中文](README.zh-CN.md)**
 
-## 使用流程
+Photo Archive Manager is an offline desktop app for organizing, checking, backing up, and encrypting photo archives. It keeps your original files in place while you review and copy them.
 
-1. 选择照片文件夹并查看扫描结果。
-2. 选择整理、检查或备份方式，并查看处理结果。
-3. 需要长期保存时，可创建加密归档。
+## How it works
 
-程序在本机处理文件。整理和备份会保留原文件；遇到同名文件时不会直接覆盖。归档完成前会检查内容，密码不会保存到恢复记录中。
+1. Choose photo folders and review the scan.
+2. Organize files, check metadata or duplicates, and create verified backups.
+3. Create an encrypted archive when you are ready to store a long-term copy.
 
-## 当前状态
+The app works with files on your computer. It does not upload photos. It checks copied and archived content before reporting success, and it does not overwrite an existing destination file. Archive passwords are not saved in recovery records.
 
-仓库包含 macOS 和 Windows 的构建产物生成方式。各平台的干净设备运行和最终分发验收尚未全部完成；请查看发布说明了解已验证范围和限制。
+On first launch, the interface defaults to English. Choose **English** or **中文** in the app header to switch languages immediately; the choice is remembered for the next launch.
 
-## 文档
+## Get a build
 
-- [技术设计与流程图](docs/technical-design.md)
-- [功能实施状态](docs/implementation-status.md)
-- [构建与发布说明](docs/release.md)
-- [目标设备验收清单](docs/acceptance-checklist.md)
-- [第三方组件与许可](resources/exiftool/THIRD_PARTY_NOTICES.md)
+On an Apple Silicon Mac, run `./scripts/build-releases.sh`. It builds the available platform targets and writes versioned ZIP files to `target/Releases/`. macOS ZIPs contain a `.app` bundle. Platform and CPU architecture are part of every ZIP filename.
+
+See [Build and release guide](docs/release.md) for prerequisites, exact filenames, output locations, and current verification limits.
+
+## More information
+
+- [Technical design and diagrams](docs/technical-design.md)
+- [Implementation status](docs/implementation-status.md)
+- [Build and release guide](docs/release.md)
+- [Clean-machine acceptance checklist](docs/acceptance-checklist.md)
+- [Third-party software and licenses](resources/THIRD_PARTY_NOTICES.md)

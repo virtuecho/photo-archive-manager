@@ -186,7 +186,10 @@ pub fn embedded_tool_version() -> &'static str {
         all(target_os = "windows", target_arch = "x86_64")
     )))]
     {
-        "当前平台暂无已验证的内置 ExifTool"
+        crate::i18n::text(
+            "No verified embedded ExifTool is available for this platform",
+            "当前平台暂无已验证的内置 ExifTool",
+        )
     }
 }
 
@@ -232,7 +235,11 @@ where
                                     MetadataRecord::read_error(
                                         path.clone(),
                                         if stderr.trim().is_empty() {
-                                            "ExifTool 未为此路径返回结果。".to_string()
+                                            crate::i18n::text(
+                                                "ExifTool returned no result for this path.",
+                                                "ExifTool 未为此路径返回结果。",
+                                            )
+                                            .to_string()
                                         } else {
                                             stderr.trim().to_string()
                                         },
@@ -242,7 +249,8 @@ where
                             progress(results.len(), total);
                         }
                         if !output.status.success() && no_entries {
-                            return Err(format!(
+                            return Err(crate::tr_format!(
+                                "ExifTool exited with code {}: {}",
                                 "ExifTool 退出码 {}：{}",
                                 output.status,
                                 stderr.trim()
@@ -254,7 +262,11 @@ where
                         for path in batch {
                             results.push(MetadataRecord::read_error(
                                 path.clone(),
-                                format!("无法解析 ExifTool JSON 输出：{error} {}", details.trim()),
+                                crate::tr_format!(
+                                    "Could not parse ExifTool JSON output: {error} {}",
+                                    "无法解析 ExifTool JSON 输出：{error} {}",
+                                    details.trim()
+                                ),
                             ));
                             progress(results.len(), total);
                         }
@@ -265,7 +277,10 @@ where
                 for path in batch {
                     results.push(MetadataRecord::read_error(
                         path.clone(),
-                        format!("无法启动内置 ExifTool：{error}"),
+                        crate::tr_format!(
+                            "Could not start bundled ExifTool: {error}",
+                            "无法启动内置 ExifTool：{error}"
+                        ),
                     ));
                     progress(results.len(), total);
                 }
@@ -325,7 +340,10 @@ fn run_exiftool(
         let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "Windows SystemRoot 环境变量不可用",
+                crate::i18n::text(
+                    "Windows SystemRoot environment variable is unavailable",
+                    "Windows SystemRoot 环境变量不可用",
+                ),
             )
         })?;
         command
@@ -345,9 +363,10 @@ fn run_exiftool(
     )))]
     {
         let _ = (tool, batch);
-        return Err(std::io::Error::other(
+        return Err(std::io::Error::other(crate::i18n::text(
+            "This build has no self-contained ExifTool payload for this platform",
             "此构建没有对应平台的自包含 ExifTool 有效载荷",
-        ));
+        )));
     }
 
     command.output()
@@ -390,13 +409,19 @@ fn windows_argfile(batch: &[PathBuf]) -> std::io::Result<String> {
         let path = path.to_str().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "文件路径不是可表示的 Unicode；请改名后重试",
+                crate::i18n::text(
+                    "File path cannot be represented as Unicode; rename it and try again",
+                    "文件路径不是可表示的 Unicode；请改名后重试",
+                ),
             )
         })?;
         if path.contains(['\r', '\n']) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "Windows ExifTool 参数文件不支持文件名中的换行符；请改名后重试",
+                crate::i18n::text(
+                    "Windows ExifTool argument files do not support line breaks in file names; rename the file and try again",
+                    "Windows ExifTool 参数文件不支持文件名中的换行符；请改名后重试",
+                ),
             ));
         }
         lines.push(path.to_string());
@@ -419,7 +444,10 @@ impl EmbeddedExifTool {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         if actual != EXIFTOOL_SHA256 {
-            return Err(format!("内置 ExifTool 校验失败：SHA-256 {actual}"));
+            return Err(crate::tr_format!(
+                "Bundled ExifTool checksum failed: SHA-256 {actual}",
+                "内置 ExifTool 校验失败：SHA-256 {actual}"
+            ));
         }
 
         let directory = private_temp_directory()?;
@@ -429,13 +457,30 @@ impl EmbeddedExifTool {
                 .write(true)
                 .create_new(true)
                 .open(&executable)
-                .map_err(|error| format!("无法创建 ExifTool 临时文件：{error}"))?;
-            file.write_all(EXIFTOOL_PAYLOAD)
-                .map_err(|error| format!("无法释放 ExifTool：{error}"))?;
-            file.sync_all()
-                .map_err(|error| format!("无法同步 ExifTool：{error}"))?;
-            set_private_executable_permissions(&executable)
-                .map_err(|error| format!("无法设置 ExifTool 权限：{error}"))?;
+                .map_err(|error| {
+                    crate::tr_format!(
+                        "Could not create temporary ExifTool file: {error}",
+                        "无法创建 ExifTool 临时文件：{error}"
+                    )
+                })?;
+            file.write_all(EXIFTOOL_PAYLOAD).map_err(|error| {
+                crate::tr_format!(
+                    "Could not extract ExifTool: {error}",
+                    "无法释放 ExifTool：{error}"
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                crate::tr_format!(
+                    "Could not sync ExifTool: {error}",
+                    "无法同步 ExifTool：{error}"
+                )
+            })?;
+            set_private_executable_permissions(&executable).map_err(|error| {
+                crate::tr_format!(
+                    "Could not set ExifTool permissions: {error}",
+                    "无法设置 ExifTool 权限：{error}"
+                )
+            })?;
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -468,7 +513,8 @@ impl EmbeddedExifTool {
     fn extract() -> Result<Self, String> {
         let archive_hash = sha256_hex(EXIFTOOL_WINDOWS_PAYLOAD);
         if archive_hash != EXIFTOOL_WINDOWS_ZIP_SHA256 {
-            return Err(format!(
+            return Err(crate::tr_format!(
+                "Bundled Windows ExifTool ZIP checksum failed: SHA-256 {archive_hash}",
                 "内置 Windows ExifTool ZIP 校验失败：SHA-256 {archive_hash}"
             ));
         }
@@ -477,17 +523,27 @@ impl EmbeddedExifTool {
         let executable = directory.join("exiftool.exe");
         let result = (|| {
             extract_windows_payload(EXIFTOOL_WINDOWS_PAYLOAD, &directory)?;
-            let executable_bytes = fs::read(&executable)
-                .map_err(|error| format!("无法读取释放后的 ExifTool：{error}"))?;
+            let executable_bytes = fs::read(&executable).map_err(|error| {
+                crate::tr_format!(
+                    "Could not read extracted ExifTool: {error}",
+                    "无法读取释放后的 ExifTool：{error}"
+                )
+            })?;
             let executable_hash = sha256_hex(&executable_bytes);
             if executable_hash != EXIFTOOL_WINDOWS_EXE_SHA256 {
-                return Err(format!(
+                return Err(crate::tr_format!(
+                    "Extracted Windows ExifTool SHA-256 mismatch: {executable_hash}",
                     "释放后的 Windows ExifTool SHA-256 不符：{executable_hash}"
                 ));
             }
 
-            let system_root = std::env::var_os("SystemRoot")
-                .ok_or_else(|| "Windows SystemRoot 环境变量不可用。".to_string())?;
+            let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
+                crate::i18n::text(
+                    "Windows SystemRoot environment variable is unavailable.",
+                    "Windows SystemRoot 环境变量不可用。",
+                )
+                .to_string()
+            })?;
             let output = Command::new(&executable)
                 .current_dir(&directory)
                 .env_clear()
@@ -497,10 +553,16 @@ impl EmbeddedExifTool {
                 .env("TMP", &directory)
                 .arg("-ver")
                 .output()
-                .map_err(|error| format!("无法启动内置 Windows ExifTool：{error}"))?;
+                .map_err(|error| {
+                    crate::tr_format!(
+                        "Could not start bundled Windows ExifTool: {error}",
+                        "无法启动内置 Windows ExifTool：{error}"
+                    )
+                })?;
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !output.status.success() || version != "13.60" {
-                return Err(format!(
+                return Err(crate::tr_format!(
+                    "Bundled Windows ExifTool version check failed: exit code {}, version output {:?}, error {}",
                     "内置 Windows ExifTool 版本检查失败：退出码 {}，版本输出 {:?}，错误 {}",
                     output.status,
                     version,
@@ -533,18 +595,33 @@ fn extract_windows_payload(payload: &[u8], directory: &Path) -> Result<(), Strin
     use std::io::Cursor;
 
     const PACKAGE_ROOT: &str = "exiftool-13.60_64";
-    let mut archive = zip::ZipArchive::new(Cursor::new(payload))
-        .map_err(|error| format!("无法读取内置 ExifTool ZIP：{error}"))?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(payload)).map_err(|error| {
+        crate::tr_format!(
+            "Could not read bundled ExifTool ZIP: {error}",
+            "无法读取内置 ExifTool ZIP：{error}"
+        )
+    })?;
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| format!("无法读取内置 ExifTool ZIP 项：{error}"))?;
-        let entry_path = entry
-            .enclosed_name()
-            .ok_or_else(|| "内置 ExifTool ZIP 含不安全路径。".to_string())?;
-        let relative = entry_path
-            .strip_prefix(PACKAGE_ROOT)
-            .map_err(|_| "内置 ExifTool ZIP 项不在预期目录内。".to_string())?;
+        let mut entry = archive.by_index(index).map_err(|error| {
+            crate::tr_format!(
+                "Could not read bundled ExifTool ZIP entry: {error}",
+                "无法读取内置 ExifTool ZIP 项：{error}"
+            )
+        })?;
+        let entry_path = entry.enclosed_name().ok_or_else(|| {
+            crate::i18n::text(
+                "Bundled ExifTool ZIP contains an unsafe path.",
+                "内置 ExifTool ZIP 含不安全路径。",
+            )
+            .to_string()
+        })?;
+        let relative = entry_path.strip_prefix(PACKAGE_ROOT).map_err(|_| {
+            crate::i18n::text(
+                "Bundled ExifTool ZIP entry is outside the expected folder.",
+                "内置 ExifTool ZIP 项不在预期目录内。",
+            )
+            .to_string()
+        })?;
         if relative.as_os_str().is_empty() {
             continue;
         }
@@ -558,31 +635,56 @@ fn extract_windows_payload(payload: &[u8], directory: &Path) -> Result<(), Strin
             directory.join(relative)
         };
         if entry.is_dir() {
-            fs::create_dir_all(&destination)
-                .map_err(|error| format!("无法创建 ExifTool 运行时目录：{error}"))?;
+            fs::create_dir_all(&destination).map_err(|error| {
+                crate::tr_format!(
+                    "Could not create ExifTool runtime folder: {error}",
+                    "无法创建 ExifTool 运行时目录：{error}"
+                )
+            })?;
             continue;
         }
-        let parent = destination
-            .parent()
-            .ok_or_else(|| "内置 ExifTool ZIP 项缺少父目录。".to_string())?;
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("无法创建 ExifTool 运行时目录：{error}"))?;
+        let parent = destination.parent().ok_or_else(|| {
+            crate::i18n::text(
+                "Bundled ExifTool ZIP entry has no parent folder.",
+                "内置 ExifTool ZIP 项缺少父目录。",
+            )
+            .to_string()
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            crate::tr_format!(
+                "Could not create ExifTool runtime folder: {error}",
+                "无法创建 ExifTool 运行时目录：{error}"
+            )
+        })?;
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&destination)
-            .map_err(|error| format!("无法释放 ExifTool 运行时文件：{error}"))?;
-        let copied = std::io::copy(&mut entry, &mut output)
-            .map_err(|error| format!("释放 ExifTool 运行时文件失败：{error}"))?;
+            .map_err(|error| {
+                crate::tr_format!(
+                    "Could not extract ExifTool runtime file: {error}",
+                    "无法释放 ExifTool 运行时文件：{error}"
+                )
+            })?;
+        let copied = std::io::copy(&mut entry, &mut output).map_err(|error| {
+            crate::tr_format!(
+                "Failed to extract ExifTool runtime file: {error}",
+                "释放 ExifTool 运行时文件失败：{error}"
+            )
+        })?;
         if copied != entry.size() {
-            return Err(format!(
+            return Err(crate::tr_format!(
+                "Bundled ExifTool ZIP entry length check failed: {}",
                 "内置 ExifTool ZIP 项长度校验失败：{}",
                 destination.display()
             ));
         }
-        output
-            .sync_all()
-            .map_err(|error| format!("无法同步 ExifTool 运行时文件：{error}"))?;
+        output.sync_all().map_err(|error| {
+            crate::tr_format!(
+                "Could not sync ExifTool runtime file: {error}",
+                "无法同步 ExifTool 运行时文件：{error}"
+            )
+        })?;
     }
     Ok(())
 }
@@ -594,10 +696,20 @@ fn private_windows_directory() -> Result<PathBuf, String> {
 
     let root = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
-        .ok_or_else(|| "Windows LOCALAPPDATA 环境变量不可用。".to_string())?
+        .ok_or_else(|| {
+            crate::i18n::text(
+                "Windows LOCALAPPDATA environment variable is unavailable.",
+                "Windows LOCALAPPDATA 环境变量不可用。",
+            )
+            .to_string()
+        })?
         .join("PhotoArchiveManager/runtime");
-    fs::create_dir_all(&root)
-        .map_err(|error| format!("无法创建 Windows 私有运行时目录：{error}"))?;
+    fs::create_dir_all(&root).map_err(|error| {
+        crate::tr_format!(
+            "Could not create private Windows runtime folder: {error}",
+            "无法创建 Windows 私有运行时目录：{error}"
+        )
+    })?;
     for _ in 0..8 {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let path = root.join(format!(
@@ -607,10 +719,19 @@ fn private_windows_directory() -> Result<PathBuf, String> {
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("无法创建 ExifTool 私有临时目录：{error}")),
+            Err(error) => {
+                return Err(crate::tr_format!(
+                    "Could not create private ExifTool temporary folder: {error}",
+                    "无法创建 ExifTool 私有临时目录：{error}"
+                ));
+            }
         }
     }
-    Err("无法分配唯一的 ExifTool 临时目录。".into())
+    Err(crate::i18n::text(
+        "Could not allocate a unique ExifTool temporary folder.",
+        "无法分配唯一的 ExifTool 临时目录。",
+    )
+    .into())
 }
 
 #[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
@@ -637,15 +758,27 @@ fn private_temp_directory() -> Result<PathBuf, String> {
             Ok(()) => {
                 if let Err(error) = set_private_directory_permissions(&path) {
                     let _ = fs::remove_dir(&path);
-                    return Err(format!("无法保护 ExifTool 临时目录：{error}"));
+                    return Err(crate::tr_format!(
+                        "Could not secure ExifTool temporary folder: {error}",
+                        "无法保护 ExifTool 临时目录：{error}"
+                    ));
                 }
                 return Ok(path);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("无法创建 ExifTool 临时目录：{error}")),
+            Err(error) => {
+                return Err(crate::tr_format!(
+                    "Could not create ExifTool temporary folder: {error}",
+                    "无法创建 ExifTool 临时目录：{error}"
+                ));
+            }
         }
     }
-    Err("无法分配唯一的 ExifTool 临时目录。".into())
+    Err(crate::i18n::text(
+        "Could not allocate a unique ExifTool temporary folder.",
+        "无法分配唯一的 ExifTool 临时目录。",
+    )
+    .into())
 }
 
 #[cfg(target_os = "macos")]
@@ -674,7 +807,11 @@ struct EmbeddedExifTool {
 )))]
 impl EmbeddedExifTool {
     fn extract() -> Result<Self, String> {
-        Err("此构建没有对应平台的自包含 ExifTool 有效载荷。".into())
+        Err(crate::i18n::text(
+            "This build has no self-contained ExifTool payload for this platform.",
+            "此构建没有对应平台的自包含 ExifTool 有效载荷。",
+        )
+        .into())
     }
 }
 
@@ -935,7 +1072,10 @@ fn parse_capture_time(entry: &Value, file_type: &str) -> ParsedTime {
         (
             Some(value_to_string(value)),
             Some(tag.to_string()),
-            Some("高 · EXIF 原始拍摄时间"),
+            Some(crate::i18n::text(
+                "High · Original EXIF capture time",
+                "高 · EXIF 原始拍摄时间",
+            )),
         )
     } else if is_video_type(file_type) {
         let value = preferred_named_tag(entry, "CreationDate", &["QuickTime"])
@@ -944,7 +1084,10 @@ fn parse_capture_time(entry: &Value, file_type: &str) -> ParsedTime {
             (
                 Some(value_to_string(value)),
                 Some(tag.to_string()),
-                Some("中 · QuickTime 日期字段"),
+                Some(crate::i18n::text(
+                    "Medium · QuickTime date field",
+                    "中 · QuickTime 日期字段",
+                )),
             )
         } else {
             (None, None, None)
@@ -1054,9 +1197,13 @@ fn normalize_datetime(raw: &str, offset_tag: Option<&str>) -> Option<(String, St
         zone = timezone.as_deref().unwrap_or("")
     );
     let precision = if fraction.is_empty() {
-        "秒精度".to_string()
+        crate::i18n::text("Second precision", "秒精度").to_string()
     } else {
-        format!("小数秒（{} 位）", fraction.len())
+        crate::tr_format!(
+            "Fractional seconds ({} digits)",
+            "小数秒（{} 位）",
+            fraction.len()
+        )
     };
     Some((normalized, precision, timezone.is_some()))
 }

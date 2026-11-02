@@ -139,7 +139,13 @@ where
             }
 
             let phash_note = if is_video(first.metadata) {
-                Some("视频不参与静态照片 pHash。".into())
+                Some(
+                    crate::i18n::text(
+                        "Videos are excluded from still-photo pHash.",
+                        "视频不参与静态照片 pHash。",
+                    )
+                    .into(),
+                )
             } else {
                 let first_hash = phashes
                     .entry(first.metadata.path.clone())

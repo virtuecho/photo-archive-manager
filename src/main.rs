@@ -14,6 +14,7 @@ mod archive;
 mod checkpoint;
 mod duplicates;
 pub mod files;
+pub mod i18n;
 mod image_formats;
 mod metadata;
 mod pipeline;
@@ -27,16 +28,18 @@ use crate::{
 };
 use zeroize::Zeroize;
 
-const STAGES: [&str; 8] = [
-    "来源选择",
-    "文件分类",
-    "分类复制",
-    "完整性校验",
-    "元数据检查",
-    "重复检查",
-    "文件备份",
-    "加密归档",
-];
+fn stage_names() -> [&'static str; 8] {
+    [
+        crate::i18n::text("Source Selection", "来源选择"),
+        crate::i18n::text("File Routing", "文件分类"),
+        crate::i18n::text("Safe Copy", "分类复制"),
+        crate::i18n::text("Integrity Check", "完整性校验"),
+        crate::i18n::text("Metadata Review", "元数据检查"),
+        crate::i18n::text("Duplicate Review", "重复检查"),
+        crate::i18n::text("Backup", "文件备份"),
+        crate::i18n::text("Encrypted Archive", "加密归档"),
+    ]
+}
 
 const LICENSE_NOTICES: &str = include_str!("../resources/THIRD_PARTY_NOTICES.md");
 const EXIFTOOL_LICENSE: &str = include_str!("../resources/exiftool/Artistic-License-1.0.pod");
@@ -254,6 +257,7 @@ impl Default for ArchiveOptions {
 #[derive(Default)]
 struct PhotoArchiveApp {
     stage: usize,
+    language: i18n::Language,
     roots: Vec<SourceRoot>,
     selected_root: Option<usize>,
     scan_receiver: Option<Receiver<ScanMessage>>,
@@ -325,12 +329,25 @@ struct PhotoArchiveApp {
 
 impl eframe::App for PhotoArchiveApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        i18n::set_current_language(self.language);
         let ctx = ui.ctx().clone();
         self.receive_scan_updates();
         self.receive_work_updates();
         self.finish_pause_switch_if_ready();
 
         eframe::egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(crate::i18n::text("Photo Archive Manager", "照片归档管理器"));
+                ui.with_layout(eframe::egui::Layout::right_to_left(eframe::egui::Align::Center), |ui| {
+                    let mut changed = ui.selectable_value(&mut self.language, i18n::Language::Chinese, "中文").changed();
+                    changed |= ui.selectable_value(&mut self.language, i18n::Language::English, "English").changed();
+                    if changed {
+                        i18n::set_current_language(self.language);
+                        let _ = i18n::save_preference(self.language);
+                    }
+                });
+            });
+            ui.separator();
             let available = ui.available_size();
             let content_height = (available.y - 145.0).max(0.0);
             ui.allocate_ui_with_layout(
@@ -341,10 +358,10 @@ impl eframe::App for PhotoArchiveApp {
                         .id_salt("stage-content")
                         .auto_shrink([true, false])
                         .show(ui, |ui| {
-                            ui.heading(format!(
-                                "阶段 {} / 8：{}",
+                            ui.heading(crate::tr_format!(
+                                "Stage {} of 8: {}", "阶段 {} / 8：{}",
                                 self.stage + 1,
-                                STAGES[self.stage]
+                                stage_names()[self.stage]
                             ));
                             ui.add_space(12.0);
                             if self.stage == 0 {
@@ -364,7 +381,7 @@ impl eframe::App for PhotoArchiveApp {
                             } else if self.stage == 7 {
                                 self.archive_stage(ui);
                             } else {
-                                ui.label("未知阶段状态；请从底部导航重新选择阶段。");
+                                ui.label(crate::i18n::text("Unknown stage. Use the navigation below to select a stage again.", "未知阶段状态；请从底部导航重新选择阶段。"));
                             }
                         });
                 },
@@ -396,14 +413,14 @@ impl eframe::App for PhotoArchiveApp {
 
 impl PhotoArchiveApp {
     fn source_selection(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("添加一个或多个来源目录。扫描只读取常规文件，不会修改来源。符号链接不会被跟随。 ");
+        ui.label(crate::i18n::text("Add one or more source folders. Scanning reads regular files only and does not modify sources. Symbolic links are not followed.", "添加一个或多个来源目录。扫描只读取常规文件，不会修改来源。符号链接不会被跟随。 "));
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !self.scanning && !self.work_running,
-                    eframe::egui::Button::new("添加来源文件夹…"),
+                    eframe::egui::Button::new(crate::i18n::text("Add Source Folder…", "添加来源文件夹…")),
                 )
                 .clicked()
             {
@@ -417,10 +434,10 @@ impl PhotoArchiveApp {
                                 .position(|root| Some(&root.path) == canonical.as_ref());
                             self.invalidate_copy_plan();
                             self.last_scan = None;
-                            self.status = "已添加来源目录；旧扫描与依赖结果已清除。".into();
+                            self.status = crate::i18n::text("Source folder added. Previous scan results and dependent results were cleared.", "已添加来源目录；旧扫描与依赖结果已清除。").into();
                         }
                         Ok(false) => {
-                            self.status = "该目录已包含在现有来源中，无需重复添加。".into()
+                            self.status = crate::i18n::text("This folder is already included in a source. No need to add it again.", "该目录已包含在现有来源中，无需重复添加。").into()
                         }
                         Err(error) => self.status = error,
                     }
@@ -432,7 +449,7 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     can_remove && !self.scanning && !self.work_running,
-                    eframe::egui::Button::new("移除选中目录"),
+                    eframe::egui::Button::new(crate::i18n::text("Remove Selected Folder", "移除选中目录")),
                 )
                 .clicked()
             {
@@ -440,13 +457,13 @@ impl PhotoArchiveApp {
                     self.roots.remove(index);
                     self.invalidate_copy_plan();
                     self.last_scan = None;
-                    self.status = "已移除来源目录；旧扫描与依赖结果已清除。".into();
+                    self.status = crate::i18n::text("Source folder removed. Previous scan results and dependent results were cleared.", "已移除来源目录；旧扫描与依赖结果已清除。").into();
                 }
             }
             if ui
                 .add_enabled(
                     !self.roots.is_empty() && !self.scanning && !self.work_running,
-                    eframe::egui::Button::new("扫描来源"),
+                    eframe::egui::Button::new(crate::i18n::text("Scan Sources", "扫描来源")),
                 )
                 .clicked()
             {
@@ -455,13 +472,13 @@ impl PhotoArchiveApp {
         });
 
         ui.add_space(8.0);
-        ui.label("来源目录");
+        ui.label(crate::i18n::text("Source Folders", "来源目录"));
         eframe::egui::ScrollArea::vertical()
             .id_salt("source-roots")
             .max_height(180.0)
             .show(ui, |ui| {
                 if self.roots.is_empty() {
-                    ui.weak("尚未添加目录");
+                    ui.weak(crate::i18n::text("No folders added yet", "尚未添加目录"));
                 }
                 let mut selected_index = None;
                 for (index, root) in self.roots.iter().enumerate() {
@@ -484,7 +501,8 @@ impl PhotoArchiveApp {
         if self.scanning {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(format!(
+                ui.label(crate::tr_format!(
+                    "Scanning: {} files, {}, {} directories visited",
                     "正在扫描：{} 个文件，{}，已访问 {} 个目录",
                     self.scan_progress.files,
                     format_bytes(self.scan_progress.bytes),
@@ -494,15 +512,31 @@ impl PhotoArchiveApp {
         }
         if let Some(summary) = &self.last_scan {
             ui.separator();
-            ui.heading("本次扫描结果");
+            ui.heading(crate::i18n::text("Scan Results", "本次扫描结果"));
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("文件：{}", summary.files.len()));
-                ui.label(format!("总大小：{}", format_bytes(summary.bytes)));
-                ui.label(format!("跳过：{}", summary.skipped));
-                ui.label(format!("无法读取：{}", summary.error_count));
+                ui.label(crate::tr_format!(
+                    "Files: {}",
+                    "文件：{}",
+                    summary.files.len()
+                ));
+                ui.label(crate::tr_format!(
+                    "Total size: {}",
+                    "总大小：{}",
+                    format_bytes(summary.bytes)
+                ));
+                ui.label(crate::tr_format!(
+                    "Skipped: {}",
+                    "跳过：{}",
+                    summary.skipped
+                ));
+                ui.label(crate::tr_format!(
+                    "Could not read: {}",
+                    "无法读取：{}",
+                    summary.error_count
+                ));
             });
             ui.add_space(4.0);
-            ui.label("扩展名统计");
+            ui.label(crate::i18n::text("File Extension Summary", "扩展名统计"));
             eframe::egui::ScrollArea::vertical()
                 .id_salt("scan-summary")
                 .max_height(260.0)
@@ -511,17 +545,24 @@ impl PhotoArchiveApp {
                         ui.label(format!("{extension}: {count}"));
                     }
                     if summary.by_extension.is_empty() {
-                        ui.weak("没有可读取的常规文件");
+                        ui.weak(crate::i18n::text(
+                            "No readable regular files found",
+                            "没有可读取的常规文件",
+                        ));
                     }
                     ui.separator();
-                    ui.label("清单预览（前 8 项）");
+                    ui.label(crate::i18n::text(
+                        "Manifest Preview (first 8 items)",
+                        "清单预览（前 8 项）",
+                    ));
                     for file in summary.files.iter().take(8) {
                         let modified = file
                             .modified
                             .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                             .map(|time| time.as_secs().to_string())
-                            .unwrap_or_else(|| "不可用".into());
-                        ui.label(format!(
+                            .unwrap_or_else(|| crate::i18n::text("Unavailable", "不可用").into());
+                        ui.label(crate::tr_format!(
+                            "Source {} · {} · {} · {} · modified Unix time {}",
                             "来源 {} · {} · {} · {} · 修改时间 Unix {}",
                             file.source_id + 1,
                             file.relative_path.display(),
@@ -535,38 +576,45 @@ impl PhotoArchiveApp {
             if let Some(error) = summary.error_samples.first() {
                 ui.colored_label(
                     eframe::egui::Color32::from_rgb(140, 85, 0),
-                    format!("示例错误：{error}"),
+                    crate::tr_format!("Example error: {error}", "示例错误：{error}"),
                 );
             }
         }
         if !self.status.is_empty() {
             ui.add_space(6.0);
-            ui.label(&self.status);
+            ui.label(i18n::localize_dynamic(self.language, &self.status));
         }
     }
 
     fn routing_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("为每种已扫描扩展名选择最终目标文件夹。多种扩展名可指向同一文件夹；未知扩展名也会列出，不会自动丢弃。");
+        ui.label(crate::i18n::text("Choose a destination folder for each scanned extension. Multiple extensions can use the same folder. Unknown extensions are listed and are not discarded automatically.", "为每种已扫描扩展名选择最终目标文件夹。多种扩展名可指向同一文件夹；未知扩展名也会列出，不会自动丢弃。"));
         let Some(summary) = &self.last_scan else {
             ui.add_space(8.0);
-            ui.weak("此会话还没有来源清单。请先在①添加目录并扫描，然后返回本阶段。");
+            ui.weak(crate::i18n::text("This session has no source manifest. Add and scan folders in stage ①, then return here.", "此会话还没有来源清单。请先在①添加目录并扫描，然后返回本阶段。"));
             return;
         };
         if summary.files.is_empty() {
             ui.add_space(8.0);
-            ui.weak("扫描清单为空，没有可路由的文件。");
+            ui.weak(crate::i18n::text(
+                "The scan manifest is empty; no files can be routed.",
+                "扫描清单为空，没有可路由的文件。",
+            ));
             return;
         }
 
         let mut routes_changed = false;
         ui.horizontal(|ui| {
-            ui.label("新增扩展名");
+            ui.label(crate::i18n::text("New Extension", "新增扩展名"));
             ui.add_enabled(
                 !self.work_running,
-                eframe::egui::TextEdit::singleline(&mut self.new_extension).hint_text("例如 XMP"),
+                eframe::egui::TextEdit::singleline(&mut self.new_extension)
+                    .hint_text(crate::i18n::text("For example, XMP", "例如 XMP")),
             );
             if ui
-                .add_enabled(!self.work_running, eframe::egui::Button::new("添加规则"))
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new(crate::i18n::text("Add Rule", "添加规则")),
+                )
                 .clicked()
             {
                 let extension = self
@@ -609,18 +657,29 @@ impl PhotoArchiveApp {
                                     && !is_system_junk(&file.relative_path)
                             })
                             .count();
-                        ui.label(format!("{} · {} 个文件", route.extension, count));
+                        ui.label(crate::tr_format!(
+                            "{} · {} files",
+                            "{} · {} 个文件",
+                            route.extension,
+                            count
+                        ));
                         ui.label(
                             route
                                 .destination
                                 .as_ref()
                                 .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "未设置目标".into()),
+                                .unwrap_or_else(|| {
+                                    crate::i18n::text("No destination selected", "未设置目标")
+                                        .into()
+                                }),
                         );
                         if ui
                             .add_enabled(
                                 !self.work_running,
-                                eframe::egui::Button::new("选择目标文件夹…"),
+                                eframe::egui::Button::new(crate::i18n::text(
+                                    "Choose Destination Folder…",
+                                    "选择目标文件夹…",
+                                )),
                             )
                             .clicked()
                         {
@@ -633,15 +692,21 @@ impl PhotoArchiveApp {
                                         }
                                     }
                                     Err(error) => {
-                                        self.status =
-                                            format!("无法解析目标目录 {}：{error}", path.display());
+                                        self.status = crate::tr_format!(
+                                            "Could not resolve destination folder {}: {error}",
+                                            "无法解析目标目录 {}：{error}",
+                                            path.display()
+                                        );
                                     }
                                 }
                             }
                         }
                         if !required_extensions.contains(&route.extension)
                             && ui
-                                .add_enabled(!self.work_running, eframe::egui::Button::new("移除"))
+                                .add_enabled(
+                                    !self.work_running,
+                                    eframe::egui::Button::new(crate::i18n::text("Remove", "移除")),
+                                )
                                 .clicked()
                         {
                             selected_route = Some(index);
@@ -666,20 +731,26 @@ impl PhotoArchiveApp {
         if missing == 0 {
             ui.colored_label(
                 eframe::egui::Color32::DARK_GREEN,
-                "所有已扫描扩展名都已映射。",
+                crate::i18n::text(
+                    "All scanned extensions have destinations.",
+                    "所有已扫描扩展名都已映射。",
+                ),
             );
         } else {
             ui.colored_label(
                 eframe::egui::Color32::DARK_RED,
-                format!(
-                    "还有 {missing} 种已扫描扩展名未设置目标；这些文件会保留在清单并跳过复制。"
+                crate::tr_format!(
+                    "{missing} scanned extensions have no destination. Their files remain in the manifest and will be skipped during copying.", "还有 {missing} 种已扫描扩展名未设置目标；这些文件会保留在清单并跳过复制。"
                 ),
             );
         }
         if ui
             .add_enabled(
                 !self.scanning && !self.work_running,
-                eframe::egui::Button::new("完成分类设置并进入下一阶段…"),
+                eframe::egui::Button::new(crate::i18n::text(
+                    "Finish Routing and Continue…",
+                    "完成分类设置并进入下一阶段…",
+                )),
             )
             .clicked()
         {
@@ -691,19 +762,22 @@ impl PhotoArchiveApp {
     }
 
     fn copy_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("复制只写入所选目标目录，不修改来源；新复制遇到已有目标会失败且不覆盖，恢复任务只会把重新校验一致的目标认作已完成。");
+        ui.label(crate::i18n::text("Copying writes only to the selected destination and never modifies sources. A new copy fails if the target already exists; it never overwrites. Recovery counts an existing target as complete only after verification.", "复制只写入所选目标目录，不修改来源；新复制遇到已有目标会失败且不覆盖，恢复任务只会把重新校验一致的目标认作已完成。"));
         if self.last_scan.is_none() {
             if let Some(items) = self.pending_copy_resume.as_ref() {
                 ui.add_space(8.0);
-                ui.label(format!(
-                    "发现上次未完成的文件复制：{} 项。恢复时会重新读取源与已有目标；不匹配的目标不会覆盖。",
+                ui.label(crate::tr_format!(
+                    "Found {} unfinished copy item(s). Recovery rereads the source and existing target; mismatched targets are not overwritten.", "发现上次未完成的文件复制：{} 项。恢复时会重新读取源与已有目标；不匹配的目标不会覆盖。",
                     items.len()
                 ));
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
                             !self.work_running,
-                            eframe::egui::Button::new("恢复上次复制任务"),
+                            eframe::egui::Button::new(crate::i18n::text(
+                                "Resume Last Copy",
+                                "恢复上次复制任务",
+                            )),
                         )
                         .clicked()
                     {
@@ -712,7 +786,10 @@ impl PhotoArchiveApp {
                     if ui
                         .add_enabled(
                             !self.work_running,
-                            eframe::egui::Button::new("丢弃恢复记录"),
+                            eframe::egui::Button::new(crate::i18n::text(
+                                "Discard Recovery Record",
+                                "丢弃恢复记录",
+                            )),
                         )
                         .clicked()
                     {
@@ -721,7 +798,7 @@ impl PhotoArchiveApp {
                 });
             } else {
                 ui.add_space(8.0);
-                ui.weak("此会话还没有来源清单。请先在①添加目录并扫描，然后返回本阶段。");
+                ui.weak(crate::i18n::text("This session has no source manifest. Add and scan folders in stage ①, then return here.", "此会话还没有来源清单。请先在①添加目录并扫描，然后返回本阶段。"));
             }
             self.copy_results_ui(ui);
             return;
@@ -731,7 +808,7 @@ impl PhotoArchiveApp {
                 !self.work_running,
                 eframe::egui::Checkbox::new(
                     &mut self.include_system_files,
-                    "包括系统垃圾文件（.DS_Store、._*、Thumbs.db、desktop.ini 等）",
+                    crate::i18n::text("Include system and junk files (.DS_Store, ._*, Thumbs.db, desktop.ini, etc.)", "包括系统垃圾文件（.DS_Store、._*、Thumbs.db、desktop.ini 等）"),
                 ),
             )
             .changed()
@@ -741,23 +818,47 @@ impl PhotoArchiveApp {
         let plan = self.copy_plan();
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("可复制：{}", plan.items.len()));
-            ui.label(format!("系统文件过滤：{}", plan.filtered));
-            ui.label(format!("未映射：{}", plan.unmapped));
-            ui.label(format!("路径重叠：{}", plan.overlap));
-            ui.label(format!("目标路径冲突：{}", plan.duplicate_targets));
-            ui.label(format!("目标已存在：{}", plan.existing_targets));
+            ui.label(crate::tr_format!(
+                "Ready to copy: {}",
+                "可复制：{}",
+                plan.items.len()
+            ));
+            ui.label(crate::tr_format!(
+                "System files filtered: {}",
+                "系统文件过滤：{}",
+                plan.filtered
+            ));
+            ui.label(crate::tr_format!(
+                "Unmapped: {}",
+                "未映射：{}",
+                plan.unmapped
+            ));
+            ui.label(crate::tr_format!(
+                "Overlapping paths: {}",
+                "路径重叠：{}",
+                plan.overlap
+            ));
+            ui.label(crate::tr_format!(
+                "Conflicting destination paths: {}",
+                "目标路径冲突：{}",
+                plan.duplicate_targets
+            ));
+            ui.label(crate::tr_format!(
+                "Existing destinations: {}",
+                "目标已存在：{}",
+                plan.existing_targets
+            ));
         });
         if plan.overlap > 0 || plan.duplicate_targets > 0 {
             ui.colored_label(
                 eframe::egui::Color32::DARK_RED,
-                "检测到来源/目标重叠或多个来源映射到同一目标路径。请调整目录或路由后再开始。",
+                crate::i18n::text("Source and destination folders overlap, or multiple sources map to the same destination. Adjust the folders or routing before you start.", "检测到来源/目标重叠或多个来源映射到同一目标路径。请调整目录或路由后再开始。"),
             );
         }
         if plan.unmapped > 0 {
             ui.colored_label(
                 eframe::egui::Color32::from_rgb(140, 85, 0),
-                "未映射文件不会被复制。可返回②为这些扩展名指定目标目录。",
+                crate::i18n::text("Unmapped files will not be copied. Return to stage ② to assign destination folders to these extensions.", "未映射文件不会被复制。可返回②为这些扩展名指定目标目录。"),
             );
         }
         let successful: std::collections::BTreeSet<(PathBuf, PathBuf)> = self
@@ -780,7 +881,13 @@ impl PhotoArchiveApp {
                 || plan.duplicate_targets > 0;
             if self.copy_results.is_empty() {
                 if ui
-                    .add_enabled(!blocked, eframe::egui::Button::new("开始安全复制"))
+                    .add_enabled(
+                        !blocked,
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "Start Safe Copy",
+                            "开始安全复制",
+                        )),
+                    )
                     .clicked()
                 {
                     self.start_copy(plan.items.clone(), false, false);
@@ -793,7 +900,10 @@ impl PhotoArchiveApp {
                             && !retry_items.is_empty()
                             && plan.overlap == 0
                             && plan.duplicate_targets == 0,
-                        eframe::egui::Button::new("继续 / 重试未通过项"),
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "Continue / Retry Failed Items",
+                            "继续 / 重试未通过项",
+                        )),
                     )
                     .clicked()
             {
@@ -801,7 +911,12 @@ impl PhotoArchiveApp {
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Copy)
-                && ui.button("取消（完成当前文件后停止）").clicked()
+                && ui
+                    .button(crate::i18n::text(
+                        "Cancel (stop after the current file)",
+                        "取消（完成当前文件后停止）",
+                    ))
+                    .clicked()
             {
                 if let Some(control) = &self.work_control {
                     control.cancel();
@@ -822,7 +937,8 @@ impl PhotoArchiveApp {
             .count();
         let failed = self.copy_results.len() - passed;
         ui.separator();
-        ui.label(format!(
+        ui.label(crate::tr_format!(
+            "Copy results: {passed} succeeded, {failed} failed, {} planned.",
             "复制结果：成功 {passed}，失败 {failed}，计划 {}。",
             self.copy_planned
         ));
@@ -839,16 +955,20 @@ impl PhotoArchiveApp {
             }
         }
         if self.copy_results.len() > 12 {
-            ui.weak(format!("另有 {} 项未展开。", self.copy_results.len() - 12));
+            ui.weak(crate::tr_format!(
+                "{} more items not shown.",
+                "另有 {} 项未展开。",
+                self.copy_results.len() - 12
+            ));
         }
     }
 
     fn verification_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("重新读取源文件和目标文件，逐项比较文件大小与 SHA-256。复制时生成的源哈希不会代替目标复读。");
+        ui.label(crate::i18n::text("Reread each source and target file and compare file size and SHA-256. A source hash calculated during copying does not replace rereading the target.", "重新读取源文件和目标文件，逐项比较文件大小与 SHA-256。复制时生成的源哈希不会代替目标复读。"));
         if self.verify_needs_recheck {
             ui.colored_label(
                 eframe::egui::Color32::from_rgb(140, 85, 0),
-                "上游文件已重新扫描或修改；旧完整性结果已失效，请重新验证。",
+                crate::i18n::text("An upstream file was rescanned or changed. The previous integrity result is no longer valid; verify again.", "上游文件已重新扫描或修改；旧完整性结果已失效，请重新验证。"),
             );
         }
         let valid_pairs = self
@@ -857,11 +977,17 @@ impl PhotoArchiveApp {
             .filter(|item| item.result.is_ok())
             .count();
         ui.horizontal(|ui| {
-            ui.label(format!("可复核的复制项：{valid_pairs}"));
+            ui.label(crate::tr_format!(
+                "Copy pairs to review: {valid_pairs}",
+                "可复核的复制项：{valid_pairs}"
+            ));
             if ui
                 .add_enabled(
                     !self.work_running && valid_pairs > 0,
-                    eframe::egui::Button::new("重新校验已复制文件"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Recheck Copied Files",
+                        "重新校验已复制文件",
+                    )),
                 )
                 .clicked()
             {
@@ -870,12 +996,15 @@ impl PhotoArchiveApp {
         });
         ui.add_space(8.0);
         ui.separator();
-        ui.label("独立校验：选择一个来源文件夹和一个整理后文件夹，按相对路径匹配并核对文件数、缺失/多余文件及 SHA-256。");
+        ui.label(crate::i18n::text("Independent verification: choose a source folder and an organized folder. Match relative paths and compare file counts, missing and extra files, and SHA-256.", "独立校验：选择一个来源文件夹和一个整理后文件夹，按相对路径匹配并核对文件数、缺失/多余文件及 SHA-256。"));
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !self.work_running,
-                    eframe::egui::Button::new("选择来源文件夹…"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Choose Source Folder…",
+                        "选择来源文件夹…",
+                    )),
                 )
                 .clicked()
             {
@@ -890,7 +1019,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running,
-                    eframe::egui::Button::new("选择目标文件夹…"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Choose Destination Folder…",
+                        "选择目标文件夹…",
+                    )),
                 )
                 .clicked()
             {
@@ -907,7 +1039,10 @@ impl PhotoArchiveApp {
                     !self.work_running
                         && self.direct_verify_source.is_some()
                         && self.direct_verify_target.is_some(),
-                    eframe::egui::Button::new("独立校验这两个文件夹"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Verify These Folders Independently",
+                        "独立校验这两个文件夹",
+                    )),
                 )
                 .clicked()
             {
@@ -915,13 +1050,20 @@ impl PhotoArchiveApp {
             }
         });
         if let Some(path) = &self.direct_verify_source {
-            ui.weak(format!("来源：{}", path.display()));
+            ui.weak(crate::tr_format!("Source: {}", "来源：{}", path.display()));
         }
         if let Some(path) = &self.direct_verify_target {
-            ui.weak(format!("目标：{}", path.display()));
+            ui.weak(crate::tr_format!(
+                "Destination: {}",
+                "目标：{}",
+                path.display()
+            ));
         }
         if self.work_running && self.work_kind == Some(WorkKind::Verify) {
-            if ui.button("取消校验").clicked() {
+            if ui
+                .button(crate::i18n::text("Cancel Verification", "取消校验"))
+                .clicked()
+            {
                 if let Some(control) = &self.work_control {
                     control.cancel();
                 }
@@ -929,8 +1071,8 @@ impl PhotoArchiveApp {
         }
         if let Some(coverage) = &self.verify_coverage {
             ui.separator();
-            ui.label(format!(
-                "目录清单：来源 {} 项，目标 {} 项；缺失 {}，多余 {}，无法读取 {}。",
+            ui.label(crate::tr_format!(
+                "Directory manifest: {} source items, {} destination items; {} missing, {} extra, {} unreadable.", "目录清单：来源 {} 项，目标 {} 项；缺失 {}，多余 {}，无法读取 {}。",
                 coverage.source_count,
                 coverage.target_count,
                 coverage.missing.len(),
@@ -940,18 +1082,18 @@ impl PhotoArchiveApp {
             for missing in coverage.missing.iter().take(5) {
                 ui.colored_label(
                     eframe::egui::Color32::DARK_RED,
-                    format!("目标缺失：{missing}"),
+                    crate::tr_format!("Missing at destination: {missing}", "目标缺失：{missing}"),
                 );
             }
             for extra in coverage.extra.iter().take(5) {
                 ui.colored_label(
                     eframe::egui::Color32::from_rgb(140, 85, 0),
-                    format!("目标多余：{extra}"),
+                    crate::tr_format!("Extra at destination: {extra}", "目标多余：{extra}"),
                 );
             }
         }
         if !self.verify_results.is_empty() {
-            ui.weak(&self.status);
+            ui.weak(i18n::localize_dynamic(self.language, &self.status));
             let matching = self
                 .verify_results
                 .iter()
@@ -959,7 +1101,8 @@ impl PhotoArchiveApp {
                 .count();
             let failed = self.verify_results.len() - matching;
             ui.separator();
-            ui.label(format!(
+            ui.label(crate::tr_format!(
+                "Read-back verification: {matching} match; {failed} mismatch or read failure.",
                 "复读校验：一致 {matching}，不一致或读取失败 {failed}。"
             ));
             for item in self.verify_results.iter().take(12) {
@@ -968,7 +1111,8 @@ impl PhotoArchiveApp {
                     Ok(result) => {
                         ui.colored_label(
                             eframe::egui::Color32::DARK_RED,
-                            format!(
+                            crate::tr_format!(
+                                "Hash/size mismatch: {} → {} (source {} B, destination {} B)",
                                 "哈希/大小不一致：{} → {}（源 {} B，目标 {} B）",
                                 item.source.display(),
                                 item.destination.display(),
@@ -993,12 +1137,12 @@ impl PhotoArchiveApp {
     }
 
     fn metadata_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("用随程序内置的 ExifTool 重新读取当前文件；不使用文件系统时间代替拍摄时间，也不改写照片。");
+        ui.label(crate::i18n::text("Reread current files with the bundled ExifTool. File-system timestamps are not used as capture times, and photos are not modified.", "用随程序内置的 ExifTool 重新读取当前文件；不使用文件系统时间代替拍摄时间，也不改写照片。"));
         ui.weak(metadata::embedded_tool_version());
         if !metadata::embedded_tool_available() {
             ui.colored_label(
                 eframe::egui::Color32::DARK_RED,
-                "此构建没有可验证的自包含 ExifTool。阶段⑤在本平台不可用；不会调用系统 PATH 中的工具。",
+                crate::i18n::text("This build has no verified, self-contained ExifTool. Stage ⑤ is unavailable on this platform; tools from the system PATH are not used.", "此构建没有可验证的自包含 ExifTool。阶段⑤在本平台不可用；不会调用系统 PATH 中的工具。"),
             );
             return;
         }
@@ -1012,7 +1156,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running && copied_files > 0,
-                    eframe::egui::Button::new(format!("检查本次已复制文件（{copied_files}）")),
+                    eframe::egui::Button::new(crate::tr_format!(
+                        "Check Files Copied This Session ({copied_files})",
+                        "检查本次已复制文件（{copied_files}）"
+                    )),
                 )
                 .clicked()
             {
@@ -1021,7 +1168,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running,
-                    eframe::egui::Button::new("选择当前整理目录…"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Choose Current Organized Folder…",
+                        "选择当前整理目录…",
+                    )),
                 )
                 .clicked()
             {
@@ -1035,7 +1185,11 @@ impl PhotoArchiveApp {
                             self.accepted_metadata_warnings.clear();
                         }
                         Err(error) => {
-                            self.status = format!("无法读取所选目录 {}：{error}", path.display());
+                            self.status = crate::tr_format!(
+                                "Could not read selected folder {}: {error}",
+                                "无法读取所选目录 {}：{error}",
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -1043,7 +1197,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running && self.metadata_directory.is_some(),
-                    eframe::egui::Button::new("扫描目录并检查 / 重新检查"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Scan Folder and Check / Recheck",
+                        "扫描目录并检查 / 重新检查",
+                    )),
                 )
                 .clicked()
             {
@@ -1051,7 +1208,12 @@ impl PhotoArchiveApp {
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Metadata)
-                && ui.button("取消元数据检查").clicked()
+                && ui
+                    .button(crate::i18n::text(
+                        "Cancel Metadata Review",
+                        "取消元数据检查",
+                    ))
+                    .clicked()
             {
                 if let Some(control) = &self.work_control {
                     control.cancel();
@@ -1059,12 +1221,16 @@ impl PhotoArchiveApp {
             }
         });
         if let Some(path) = &self.metadata_directory {
-            ui.weak(format!("所选目录：{}", path.display()));
+            ui.weak(crate::tr_format!(
+                "Selected folder: {}",
+                "所选目录：{}",
+                path.display()
+            ));
         }
         ui.add_space(8.0);
 
         if !self.status.is_empty() {
-            ui.label(&self.status);
+            ui.label(i18n::localize_dynamic(self.language, &self.status));
         }
         if !self.metadata_results.is_empty() {
             let valid_gps = self
@@ -1095,8 +1261,8 @@ impl PhotoArchiveApp {
                 .filter(|item| metadata_record_is_warning(item))
                 .count();
             ui.separator();
-            ui.label(format!(
-                "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 警告 {warnings}（已接受 {accepted_warnings}）· 读取错误 {read_errors}",
+            ui.label(crate::tr_format!(
+                "Checked {} items · GPS valid {valid_gps} · capture time valid {valid_time} · warnings {warnings} ({accepted_warnings} accepted) · read errors {read_errors}", "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 警告 {warnings}（已接受 {accepted_warnings}）· 读取错误 {read_errors}",
                 self.metadata_results.len(),
             ));
             let resolved_field_count = self
@@ -1107,8 +1273,8 @@ impl PhotoArchiveApp {
             if resolved_field_count > 0 {
                 ui.colored_label(
                     eframe::egui::Color32::DARK_GREEN,
-                    format!(
-                        "RESOLVED：本轮复查确认 {resolved_field_count} 个先前异常字段已转为有效。"
+                    crate::tr_format!(
+                        "RESOLVED: This review confirmed that {resolved_field_count} previously invalid fields are now valid.", "RESOLVED：本轮复查确认 {resolved_field_count} 个先前异常字段已转为有效。"
                     ),
                 );
             }
@@ -1127,13 +1293,16 @@ impl PhotoArchiveApp {
                                 if accepted {
                                     ui.colored_label(
                                         eframe::egui::Color32::DARK_BLUE,
-                                        "ACCEPTED · 用户接受当前警告",
+                                        crate::i18n::text(
+                                            "ACCEPTED · User accepted the current warning",
+                                            "ACCEPTED · 用户接受当前警告",
+                                        ),
                                     );
                                 }
                                 let button = if accepted {
-                                    "撤销接受"
+                                    crate::i18n::text("Undo Acceptance", "撤销接受")
                                 } else {
-                                    "接受当前警告"
+                                    crate::i18n::text("Accept Current Warning", "接受当前警告")
                                 };
                                 if ui.button(button).clicked() {
                                     if accepted {
@@ -1145,9 +1314,12 @@ impl PhotoArchiveApp {
                                 }
                             }
                             ui.horizontal_wrapped(|ui| {
-                                ui.label(format!(
+                                ui.label(crate::tr_format!(
+                                    "Type: {}",
                                     "类型：{}",
-                                    item.file_type.as_deref().unwrap_or("未知")
+                                    item.file_type
+                                        .as_deref()
+                                        .unwrap_or(crate::i18n::text("Unknown", "未知"))
                                 ));
                                 let gps_status = format!("GPS：{}", item.gps_status.label());
                                 if resolved.is_some_and(|fields| fields.gps) {
@@ -1166,7 +1338,10 @@ impl PhotoArchiveApp {
                                 if item.gps_zero_zero {
                                     ui.colored_label(
                                         eframe::egui::Color32::from_rgb(140, 85, 0),
-                                        "坐标为 0,0，请人工确认",
+                                        crate::i18n::text(
+                                            "Coordinates are 0,0; please review",
+                                            "坐标为 0,0，请人工确认",
+                                        ),
                                     );
                                 }
                                 if let Some(source) = &item.gps_source {
@@ -1174,8 +1349,11 @@ impl PhotoArchiveApp {
                                 }
                             });
                             ui.horizontal_wrapped(|ui| {
-                                let capture_time_status =
-                                    format!("拍摄时间：{}", item.time_status.label());
+                                let capture_time_status = crate::tr_format!(
+                                    "Capture time: {}",
+                                    "拍摄时间：{}",
+                                    item.time_status.label()
+                                );
                                 if resolved.is_some_and(|fields| fields.capture_time) {
                                     ui.colored_label(
                                         eframe::egui::Color32::DARK_GREEN,
@@ -1186,11 +1364,14 @@ impl PhotoArchiveApp {
                                 }
                                 if let Some(value) = &item.capture_normalized {
                                     ui.label(value);
-                                    ui.weak(item.capture_precision.as_deref().unwrap_or(""));
+                                    ui.weak(i18n::localize_dynamic(
+                                        self.language,
+                                        item.capture_precision.as_deref().unwrap_or(""),
+                                    ));
                                     ui.weak(if item.capture_has_timezone {
-                                        "含时区"
+                                        crate::i18n::text("Time zone included", "含时区")
                                     } else {
-                                        "时区未知"
+                                        crate::i18n::text("Time zone unknown", "时区未知")
                                     });
                                 }
                                 if let Some(source) = &item.capture_source {
@@ -1200,7 +1381,7 @@ impl PhotoArchiveApp {
                                     ui.weak(confidence);
                                 }
                                 if let Some(raw) = &item.capture_raw {
-                                    ui.weak(format!("原始值：{raw}"));
+                                    ui.weak(crate::tr_format!("Raw value: {raw}", "原始值：{raw}"));
                                 }
                             });
                             let camera = [
@@ -1216,21 +1397,23 @@ impl PhotoArchiveApp {
                                 ui.weak(camera);
                             }
                             let details = [
-                                item.focal_length
-                                    .as_ref()
-                                    .map(|value| format!("焦距 {value}")),
-                                item.exposure_time
-                                    .as_ref()
-                                    .map(|value| format!("曝光 {value}")),
+                                item.focal_length.as_ref().map(|value| {
+                                    crate::tr_format!("Focal length {value}", "焦距 {value}")
+                                }),
+                                item.exposure_time.as_ref().map(|value| {
+                                    crate::tr_format!("Exposure {value}", "曝光 {value}")
+                                }),
                                 item.iso.as_ref().map(|value| format!("ISO {value}")),
-                                item.altitude.as_ref().map(|value| format!("海拔 {value}")),
+                                item.altitude.as_ref().map(|value| {
+                                    crate::tr_format!("Altitude {value}", "海拔 {value}")
+                                }),
                             ]
                             .into_iter()
                             .flatten()
                             .collect::<Vec<_>>()
                             .join(" · ");
                             if !details.is_empty() {
-                                ui.weak(details);
+                                ui.weak(i18n::localize_dynamic(self.language, &details));
                             }
                             if let Some(error) = &item.error {
                                 ui.colored_label(eframe::egui::Color32::DARK_RED, error);
@@ -1238,7 +1421,8 @@ impl PhotoArchiveApp {
                         });
                     }
                     if self.metadata_results.len() > 80 {
-                        ui.weak(format!(
+                        ui.weak(crate::tr_format!(
+                            "{} more items not shown.",
                             "另有 {} 项未展开。",
                             self.metadata_results.len() - 80
                         ));
@@ -1248,12 +1432,15 @@ impl PhotoArchiveApp {
     }
 
     fn duplicates_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("重新扫描所选目录并读取可信拍摄时间。SHA-256 相同表示字节完全相同；时间接近与 pHash 只产生人工审核候选，不会自动删除文件。");
+        ui.label(crate::i18n::text("Rescan the selected folder and read trusted capture times. Matching SHA-256 means identical bytes. Nearby times and pHash produce candidates for manual review only; files are never deleted automatically.", "重新扫描所选目录并读取可信拍摄时间。SHA-256 相同表示字节完全相同；时间接近与 pHash 只产生人工审核候选，不会自动删除文件。"));
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     !self.work_running,
-                    eframe::egui::Button::new("选择待检查目录…"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Choose Folder to Review…",
+                        "选择待检查目录…",
+                    )),
                 )
                 .clicked()
             {
@@ -1266,7 +1453,11 @@ impl PhotoArchiveApp {
                             self.clear_candidate_preview();
                         }
                         Err(error) => {
-                            self.status = format!("无法读取所选目录 {}：{error}", path.display());
+                            self.status = crate::tr_format!(
+                                "Could not read selected folder {}: {error}",
+                                "无法读取所选目录 {}：{error}",
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -1274,7 +1465,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running && self.duplicate_directory.is_some(),
-                    eframe::egui::Button::new("完整重新扫描并检查"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Full Rescan and Review",
+                        "完整重新扫描并检查",
+                    )),
                 )
                 .clicked()
             {
@@ -1282,14 +1476,20 @@ impl PhotoArchiveApp {
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Duplicates)
-                && ui.button("取消重复检查").clicked()
+                && ui
+                    .button(crate::i18n::text("Cancel Duplicate Review", "取消重复检查"))
+                    .clicked()
                 && let Some(control) = &self.work_control
             {
                 control.cancel();
             }
         });
         if let Some(path) = &self.duplicate_directory {
-            ui.weak(format!("所选目录：{}", path.display()));
+            ui.weak(crate::tr_format!(
+                "Selected folder: {}",
+                "所选目录：{}",
+                path.display()
+            ));
         }
         let mut duplicate_options_changed = false;
         ui.horizontal(|ui| {
@@ -1300,14 +1500,20 @@ impl PhotoArchiveApp {
                         &mut self.duplicate_options.time_threshold_seconds,
                         0..=60,
                     )
-                    .text("拍摄时间窗口（秒）"),
+                    .text(crate::i18n::text(
+                        "Capture-time window (seconds)",
+                        "拍摄时间窗口（秒）",
+                    )),
                 )
                 .changed();
             duplicate_options_changed |= ui
                 .add_enabled(
                     !self.work_running,
                     eframe::egui::Slider::new(&mut self.duplicate_options.phash_threshold, 0..=64)
-                        .text("pHash 相似阈值（汉明距离）"),
+                        .text(crate::i18n::text(
+                            "pHash similarity threshold (Hamming distance)",
+                            "pHash 相似阈值（汉明距离）",
+                        )),
                 )
                 .changed();
         });
@@ -1315,19 +1521,23 @@ impl PhotoArchiveApp {
             self.duplicate_report = None;
             self.clear_candidate_preview();
             self.clear_saved_review();
-            self.status = "重复检查阈值已更改；请重新扫描后再携带审核结果。".into();
+            self.status = crate::i18n::text(
+                "Duplicate review settings changed. Rescan before carrying review results forward.",
+                "重复检查阈值已更改；请重新扫描后再携带审核结果。",
+            )
+            .into();
         }
-        ui.weak("时区未知的拍摄时间不会参与跨文件比较。视频仍参与 SHA-256 和时间候选，但不计算静态照片 pHash。离线预览和 pHash 支持 JPEG、PNG、HEIC、HEIF；RAW 或解码失败的格式会显示原因。");
+        ui.weak(crate::i18n::text("Capture times without a time zone are excluded from cross-file comparison. Videos are included in SHA-256 and time matching, but do not get a still-photo pHash. Offline preview and pHash support JPEG, PNG, HEIC, and HEIF; RAW or unsupported formats show the reason.", "时区未知的拍摄时间不会参与跨文件比较。视频仍参与 SHA-256 和时间候选，但不计算静态照片 pHash。离线预览和 pHash 支持 JPEG、PNG、HEIC、HEIF；RAW 或解码失败的格式会显示原因。"));
         if !self.status.is_empty() {
-            ui.label(&self.status);
+            ui.label(i18n::localize_dynamic(self.language, &self.status));
         }
 
         let Some(report) = &self.duplicate_report else {
             return;
         };
         ui.separator();
-        ui.label(format!(
-            "精确重复组 {} · 时间候选 {} · 有效拍摄时间缺少时区 {} 项 · 因设备不同跳过 {} 对 · 已标记排除 {} 项",
+        ui.label(crate::tr_format!(
+            "Exact duplicate groups {} · time candidates {} · capture times missing a time zone {} · pairs skipped because devices differ {} · excluded {} items", "精确重复组 {} · 时间候选 {} · 有效拍摄时间缺少时区 {} 项 · 因设备不同跳过 {} 对 · 已标记排除 {} 项",
             report.exact_groups.len(),
             report.time_candidates.len(),
             report.unknown_timezone_count,
@@ -1337,20 +1547,27 @@ impl PhotoArchiveApp {
         if report.time_candidates_truncated {
             ui.colored_label(
                 eframe::egui::Color32::from_rgb(160, 90, 0),
-                "候选超过 100,000 对，结果已截断。请缩小目录范围后重新扫描。",
+                crate::i18n::text("More than 100,000 candidate pairs were found; results were truncated. Narrow the folder scope and scan again.", "候选超过 100,000 对，结果已截断。请缩小目录范围后重新扫描。"),
             );
         }
         if !report.hash_errors.is_empty() {
             ui.colored_label(
                 eframe::egui::Color32::DARK_RED,
-                format!("{} 个文件读取 SHA-256 失败。", report.hash_errors.len()),
+                crate::tr_format!(
+                    "{} files failed SHA-256 reading.",
+                    "{} 个文件读取 SHA-256 失败。",
+                    report.hash_errors.len()
+                ),
             );
         }
         let mut review_changed = false;
         if ui
             .add_enabled(
                 !self.work_running && !self.excluded_final_paths.is_empty(),
-                eframe::egui::Button::new("清除本次排除标记（全部保留）"),
+                eframe::egui::Button::new(crate::i18n::text(
+                    "Clear Session Exclusions (Keep All)",
+                    "清除本次排除标记（全部保留）",
+                )),
             )
             .clicked()
             && !self.excluded_final_paths.is_empty()
@@ -1365,10 +1582,11 @@ impl PhotoArchiveApp {
             .max_height(480.0)
             .show(ui, |ui| {
                 if !report.exact_groups.is_empty() {
-                    ui.heading("字节完全相同");
+                    ui.heading(crate::i18n::text("Byte-for-byte identical", "字节完全相同"));
                     for group in &report.exact_groups {
                         ui.group(|ui| {
-                            ui.label(format!(
+                            ui.label(crate::tr_format!(
+                                "SHA-256 {} · {} paths",
                                 "SHA-256 {} · {} 个路径",
                                 group.sha256,
                                 group.paths.len()
@@ -1380,7 +1598,11 @@ impl PhotoArchiveApp {
                                         !self.work_running,
                                         eframe::egui::Checkbox::new(
                                             &mut exclude,
-                                            format!("排除本次最终清单：{}", path.display()),
+                                            crate::tr_format!(
+                                                "Exclude from This Session’s Final Manifest: {}",
+                                                "排除本次最终清单：{}",
+                                                path.display()
+                                            ),
                                         ),
                                     )
                                     .changed()
@@ -1398,26 +1620,49 @@ impl PhotoArchiveApp {
                 }
                 if !report.time_candidates.is_empty() {
                     ui.add_space(8.0);
-                    ui.heading("拍摄时间候选（仅供人工复核）");
+                    ui.heading(crate::i18n::text(
+                        "Capture-Time Candidates (Manual Review Only)",
+                        "拍摄时间候选（仅供人工复核）",
+                    ));
                     for candidate in &report.time_candidates {
                         ui.group(|ui| {
-                            if ui.button("并排预览（JPEG/PNG）").clicked() {
+                            if ui
+                                .button(crate::i18n::text(
+                                    "Side-by-Side Preview (JPEG/PNG)",
+                                    "并排预览（JPEG/PNG）",
+                                ))
+                                .clicked()
+                            {
                                 preview_request =
                                     Some((candidate.first.clone(), candidate.second.clone()));
                             }
-                            ui.label(format!(
+                            ui.label(crate::tr_format!(
+                                "Time difference {:.3} seconds{}",
                                 "时间差 {:.3} 秒{}",
                                 candidate.delta_millis as f64 / 1000.0,
                                 candidate.phash_distance.map_or_else(
-                                    || " · 未计算 pHash".to_string(),
+                                    || crate::i18n::text(
+                                        "· pHash not calculated",
+                                        " · 未计算 pHash"
+                                    )
+                                    .to_string(),
                                     |distance| {
                                         let class =
                                             if distance <= self.duplicate_options.phash_threshold {
-                                                "视觉相似候选"
+                                                crate::i18n::text(
+                                                    "Visual Match Candidate",
+                                                    "视觉相似候选",
+                                                )
                                             } else {
-                                                "视觉差异较大"
+                                                crate::i18n::text(
+                                                    "Low Visual Similarity",
+                                                    "视觉差异较大",
+                                                )
                                             };
-                                        format!(" · pHash 汉明距离 {distance}/64 · {class}")
+                                        crate::tr_format!(
+                                            "· pHash Hamming distance {distance}/64 · {class}",
+                                            " · pHash 汉明距离 {distance}/64 · {class}"
+                                        )
                                     }
                                 )
                             ));
@@ -1442,7 +1687,11 @@ impl PhotoArchiveApp {
                                     !self.work_running,
                                     eframe::egui::Checkbox::new(
                                         &mut exclude,
-                                        format!("排除本次最终清单：{}", candidate.second.display()),
+                                        crate::tr_format!(
+                                            "Exclude from This Session’s Final Manifest: {}",
+                                            "排除本次最终清单：{}",
+                                            candidate.second.display()
+                                        ),
                                     ),
                                 )
                                 .changed()
@@ -1460,11 +1709,16 @@ impl PhotoArchiveApp {
                 for (path, error) in report.hash_errors.iter().take(50) {
                     ui.colored_label(
                         eframe::egui::Color32::DARK_RED,
-                        format!("SHA-256 失败：{}：{error}", path.display()),
+                        crate::tr_format!(
+                            "SHA-256 failed for {}: {error}",
+                            "SHA-256 失败：{}：{error}",
+                            path.display()
+                        ),
                     );
                 }
                 if report.hash_errors.len() > 50 {
-                    ui.weak(format!(
+                    ui.weak(crate::tr_format!(
+                        "{} more read errors not shown.",
                         "另有 {} 个读取错误未展开。",
                         report.hash_errors.len() - 50
                     ));
@@ -1479,16 +1733,16 @@ impl PhotoArchiveApp {
     }
 
     fn backup_stage(&mut self, ui: &mut eframe::egui::Ui) {
-        ui.label("每行将一个本地整理文件夹映射到一个或多个独立备份目标。目标是最终文件夹本身；复制后会重新读取源与每个目标文件并逐项比较 SHA-256。此阶段可单独使用。");
+        ui.label(crate::i18n::text("Map each locally organized folder to one or more separate backup destinations. Each destination is the final folder itself. After copying, the app rereads the source and every destination file and compares SHA-256 individually. This stage can be used on its own.", "每行将一个本地整理文件夹映射到一个或多个独立备份目标。目标是最终文件夹本身；复制后会重新读取源与每个目标文件并逐项比较 SHA-256。此阶段可单独使用。"));
         if self.backup_needs_recheck {
             ui.colored_label(
                 eframe::egui::Color32::from_rgb(140, 85, 0),
-                "来源文件、审核清单或备份映射已变化；旧备份结果已失效，请重新扫描并验证。",
+                crate::i18n::text("A source file, review manifest, or backup mapping changed. Previous backup results are no longer valid; scan and verify again.", "来源文件、审核清单或备份映射已变化；旧备份结果已失效，请重新扫描并验证。"),
             );
         }
         if !self.excluded_final_paths.is_empty() {
-            ui.weak(format!(
-                "本次会话携带 {} 个阶段⑥排除标记；路径完全匹配的文件将从备份清单排除。",
+            ui.weak(crate::tr_format!(
+                "This session carries {} exclusions from stage ⑥. Files with matching absolute paths will be excluded from the backup manifest.", "本次会话携带 {} 个阶段⑥排除标记；路径完全匹配的文件将从备份清单排除。",
                 self.excluded_final_paths.len()
             ));
         }
@@ -1499,30 +1753,39 @@ impl PhotoArchiveApp {
             )
         }) {
             let checkpoint_note = if self.review_checkpoint_saved {
-                "审核决定保存在本机私有检查点。"
+                crate::i18n::text(
+                    "Review decisions are saved in a private local checkpoint.",
+                    "审核决定保存在本机私有检查点。",
+                )
             } else {
-                "审核决定仅在当前运行中可用；检查点未保存。"
+                crate::i18n::text(
+                    "Review decisions are available only in this run; the checkpoint was not saved.",
+                    "审核决定仅在当前运行中可用；检查点未保存。",
+                )
             };
             let mut clear_review = false;
             ui.horizontal_wrapped(|ui| {
-                ui.weak(format!(
-                    "阶段⑥ Final Manifest：{} 个已确认文件；与 {} 重叠的备份来源只处理这些路径并核对 SHA-256。{}",
+                ui.weak(crate::tr_format!(
+                    "Stage ⑥ Final Manifest: {} confirmed files. For backup sources overlapping {}, only these paths will be processed and checked with SHA-256. {}", "阶段⑥ Final Manifest：{} 个已确认文件；与 {} 重叠的备份来源只处理这些路径并核对 SHA-256。{}",
                     count, root, checkpoint_note
                 ));
-                if ui.button("清除审核清单").clicked() {
+                if ui.button(crate::i18n::text("Clear Review Manifest", "清除审核清单")).clicked() {
                     clear_review = true;
                 }
             });
             if clear_review {
                 self.clear_saved_review();
-                self.status = "已清除本机阶段⑥审核清单；后续备份将重新扫描所选目录。".into();
+                self.status = crate::i18n::text("Cleared the stage ⑥ review manifest on this device. The next backup will rescan the selected folders.", "已清除本机阶段⑥审核清单；后续备份将重新扫描所选目录。").into();
             }
         }
         let mut mappings_changed = false;
         if ui
             .add_enabled(
                 !self.work_running,
-                eframe::egui::Button::new("添加本地整理文件夹…"),
+                eframe::egui::Button::new(crate::i18n::text(
+                    "Add Organized Folder…",
+                    "添加本地整理文件夹…",
+                )),
             )
             .clicked()
         {
@@ -1536,7 +1799,11 @@ impl PhotoArchiveApp {
                         mappings_changed = true;
                     }
                     Err(error) => {
-                        self.status = format!("无法读取所选来源 {}：{error}", path.display());
+                        self.status = crate::tr_format!(
+                            "Could not read selected source {}: {error}",
+                            "无法读取所选来源 {}：{error}",
+                            path.display()
+                        );
                     }
                 }
             }
@@ -1548,9 +1815,19 @@ impl PhotoArchiveApp {
             let mut remove_target = None;
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.strong(format!("来源文件夹 {}", index + 1));
+                    ui.strong(crate::tr_format!(
+                        "Source Folder {}",
+                        "来源文件夹 {}",
+                        index + 1
+                    ));
                     if ui
-                        .add_enabled(!self.work_running, eframe::egui::Button::new("移除此行"))
+                        .add_enabled(
+                            !self.work_running,
+                            eframe::egui::Button::new(crate::i18n::text(
+                                "Remove This Row",
+                                "移除此行",
+                            )),
+                        )
                         .clicked()
                     {
                         remove_mapping = Some(index);
@@ -1560,7 +1837,10 @@ impl PhotoArchiveApp {
                     if ui
                         .add_enabled(
                             !self.work_running,
-                            eframe::egui::Button::new("选择/更改来源…"),
+                            eframe::egui::Button::new(crate::i18n::text(
+                                "Choose / Change Source…",
+                                "选择/更改来源…",
+                            )),
                         )
                         .clicked()
                         && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -1573,20 +1853,34 @@ impl PhotoArchiveApp {
                                 }
                             }
                             Err(error) => {
-                                self.status = format!("无法读取来源 {}：{error}", path.display());
+                                self.status = crate::tr_format!(
+                                    "Could not read source {}: {error}",
+                                    "无法读取来源 {}：{error}",
+                                    path.display()
+                                );
                             }
                         }
                     }
                     ui.label(mapping.source.as_deref().map_or_else(
-                        || "尚未选择来源".to_string(),
+                        || crate::i18n::text("No source selected", "尚未选择来源").to_string(),
                         |path| path.display().to_string(),
                     ));
                 });
                 for (target_index, target) in mapping.targets.iter().enumerate() {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("备份目标：{}", target.display()));
+                        ui.label(crate::tr_format!(
+                            "Backup destination: {}",
+                            "备份目标：{}",
+                            target.display()
+                        ));
                         if ui
-                            .add_enabled(!self.work_running, eframe::egui::Button::new("移除目标"))
+                            .add_enabled(
+                                !self.work_running,
+                                eframe::egui::Button::new(crate::i18n::text(
+                                    "Remove Destination",
+                                    "移除目标",
+                                )),
+                            )
                             .clicked()
                         {
                             remove_target = Some(target_index);
@@ -1596,7 +1890,10 @@ impl PhotoArchiveApp {
                 if ui
                     .add_enabled(
                         !self.work_running,
-                        eframe::egui::Button::new("+ 添加备份目标文件夹…"),
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "+ Add Backup Destination Folder…",
+                            "+ 添加备份目标文件夹…",
+                        )),
                     )
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -1609,7 +1906,11 @@ impl PhotoArchiveApp {
                             }
                         }
                         Err(error) => {
-                            self.status = format!("无法读取备份目标 {}：{error}", path.display());
+                            self.status = crate::tr_format!(
+                                "Could not read backup destination {}: {error}",
+                                "无法读取备份目标 {}：{error}",
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -1629,8 +1930,8 @@ impl PhotoArchiveApp {
             self.pending_backup_resume = None;
             let checkpoint_error = checkpoint::clear_pending_backup().err();
             self.status = checkpoint_error.map_or_else(
-                || "备份映射已修改；旧备份校验结果已清除。".into(),
-                |error| format!("备份映射已修改，旧结果已清除；删除过期检查点失败：{error}"),
+                || crate::i18n::text("Backup mapping changed; previous verification results were cleared.", "备份映射已修改；旧备份校验结果已清除。").into(),
+                |error| crate::tr_format!("Backup mapping changed and previous results were cleared, but an old checkpoint could not be deleted: {error}", "备份映射已修改，旧结果已清除；删除过期检查点失败：{error}"),
             );
         }
 
@@ -1640,15 +1941,18 @@ impl PhotoArchiveApp {
                 .map(|mapping| mapping.targets.len())
                 .sum::<usize>();
             ui.separator();
-            ui.label(format!(
-                "发现上次未完成的备份任务：{} 个来源、{target_count} 个目标。恢复会重新扫描来源，并校验已有目标；不会覆盖不匹配的文件。",
+            ui.label(crate::tr_format!(
+                "Found an unfinished backup task with {} source(s) and {target_count} destination(s). Recovery rescans the sources and verifies existing destinations; mismatched files are not overwritten.", "发现上次未完成的备份任务：{} 个来源、{target_count} 个目标。恢复会重新扫描来源，并校验已有目标；不会覆盖不匹配的文件。",
                 mappings.len()
             ));
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(
                         !self.work_running,
-                        eframe::egui::Button::new("重新扫描并恢复备份"),
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "Rescan and Resume Backup",
+                            "重新扫描并恢复备份",
+                        )),
                     )
                     .clicked()
                 {
@@ -1657,7 +1961,10 @@ impl PhotoArchiveApp {
                 if ui
                     .add_enabled(
                         !self.work_running,
-                        eframe::egui::Button::new("丢弃备份恢复记录"),
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "Discard Backup Recovery",
+                            "丢弃备份恢复记录",
+                        )),
                     )
                     .clicked()
                 {
@@ -1674,7 +1981,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running && ready && self.pending_backup_resume.is_none(),
-                    eframe::egui::Button::new("开始 / 重试复制并校验"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Start / Retry Copy and Verify",
+                        "开始 / 重试复制并校验",
+                    )),
                 )
                 .clicked()
             {
@@ -1683,7 +1993,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running && ready,
-                    eframe::egui::Button::new("重新检查现有目标"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Recheck Existing Destinations",
+                        "重新检查现有目标",
+                    )),
                 )
                 .clicked()
             {
@@ -1691,18 +2004,23 @@ impl PhotoArchiveApp {
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Backup)
-                && ui.button("取消备份").clicked()
+                && ui
+                    .button(crate::i18n::text("Cancel Backup", "取消备份"))
+                    .clicked()
                 && let Some(control) = &self.work_control
             {
                 control.cancel();
             }
         });
         if !self.status.is_empty() {
-            ui.label(&self.status);
+            ui.label(i18n::localize_dynamic(self.language, &self.status));
         }
         if !self.backup_verification.is_empty() {
             ui.separator();
-            ui.heading("每个备份目标的当前校验");
+            ui.heading(crate::i18n::text(
+                "Current Verification by Backup Destination",
+                "每个备份目标的当前校验",
+            ));
             for mapping in &self.backup_mappings {
                 for target in &mapping.targets {
                     let copy_rows = self
@@ -1733,8 +2051,8 @@ impl PhotoArchiveApp {
                             failed += 1;
                         }
                     }
-                    ui.label(format!(
-                        "{} · 复制成功 {copy_ok} / 失败 {copy_failed} · 读回校验 {passed} PASS / {failed} FAIL（{examined} 项）",
+                    ui.label(crate::tr_format!(
+                        "{} · Copy: {copy_ok} succeeded / {copy_failed} failed · Read-back: {passed} PASS / {failed} FAIL ({examined} items)", "{} · 复制成功 {copy_ok} / 失败 {copy_failed} · 读回校验 {passed} PASS / {failed} FAIL（{examined} 项）",
                         target.display(),
                     ));
                 }
@@ -1750,9 +2068,20 @@ impl PhotoArchiveApp {
                         .take(50)
                     {
                         ui.group(|ui| {
-                            ui.colored_label(eframe::egui::Color32::DARK_RED, "复制失败");
-                            ui.label(format!("源：{}", item.source.display()));
-                            ui.label(format!("目标：{}", item.destination.display()));
+                            ui.colored_label(
+                                eframe::egui::Color32::DARK_RED,
+                                crate::i18n::text("Copy Failed", "复制失败"),
+                            );
+                            ui.label(crate::tr_format!(
+                                "Source: {}",
+                                "源：{}",
+                                item.source.display()
+                            ));
+                            ui.label(crate::tr_format!(
+                                "Destination: {}",
+                                "目标：{}",
+                                item.destination.display()
+                            ));
                             if let Err(error) = &item.result {
                                 ui.colored_label(eframe::egui::Color32::DARK_RED, error);
                             }
@@ -1769,12 +2098,21 @@ impl PhotoArchiveApp {
                                 },
                                 if matching { "PASS" } else { "FAIL" },
                             );
-                            ui.label(format!("源：{}", item.source.display()));
-                            ui.label(format!("目标：{}", item.destination.display()));
+                            ui.label(crate::tr_format!(
+                                "Source: {}",
+                                "源：{}",
+                                item.source.display()
+                            ));
+                            ui.label(crate::tr_format!(
+                                "Destination: {}",
+                                "目标：{}",
+                                item.destination.display()
+                            ));
                             if let Ok(result) = &item.result
                                 && !result.matches
                             {
-                                ui.weak(format!(
+                                ui.weak(crate::tr_format!(
+                                    "Source {} / {} · Destination {} / {}",
                                     "源 {} / {} · 目标 {} / {}",
                                     result.source_size,
                                     result.source_sha256,
@@ -1787,7 +2125,8 @@ impl PhotoArchiveApp {
                         });
                     }
                     if self.backup_verification.len() > 100 {
-                        ui.weak(format!(
+                        ui.weak(crate::tr_format!(
+                            "{} more items not shown.",
                             "另有 {} 项未展开。",
                             self.backup_verification.len() - 100
                         ));
@@ -1798,16 +2137,19 @@ impl PhotoArchiveApp {
 
     fn archive_stage(&mut self, ui: &mut eframe::egui::Ui) {
         let mut archive_inputs_changed = false;
-        ui.label("选择一个本地文件夹，生成内部含同名顶层目录的加密 7z Store 归档；完成后逐项核对归档清单并流式重算 SHA-256。");
+        ui.label(crate::i18n::text("Choose one folder on this device to create an encrypted 7z Store archive with a same-named top-level folder. After creation, the app checks the archive manifest and streams SHA-256 again for every file.", "选择一个本地文件夹，生成内部含同名顶层目录的加密 7z Store 归档；完成后逐项核对归档清单并流式重算 SHA-256。"));
         ui.colored_label(
             eframe::egui::Color32::from_rgb(40, 105, 40),
-            "超过单卷大小时会输出 .7z.001/.002… 卷集；它们是一份逻辑归档，请保持所有卷同目录并确保卷齐全。",
+            crate::i18n::text("If the size limit is exceeded, the archive is split into .7z.001/.002… volumes. Together they form one logical archive; keep all volumes in the same folder and make sure none are missing.", "超过单卷大小时会输出 .7z.001/.002… 卷集；它们是一份逻辑归档，请保持所有卷同目录并确保卷齐全。"),
         );
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     !self.work_running,
-                    eframe::egui::Button::new("选择归档来源文件夹…"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Choose Archive Source Folder…",
+                        "选择归档来源文件夹…",
+                    )),
                 )
                 .clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -1822,12 +2164,16 @@ impl PhotoArchiveApp {
                         }
                     }
                     Err(error) => {
-                        self.status = format!("无法读取归档来源 {}：{error}", path.display());
+                        self.status = crate::tr_format!(
+                            "Could not read archive source {}: {error}",
+                            "无法读取归档来源 {}：{error}",
+                            path.display()
+                        );
                     }
                 }
             }
             ui.label(self.archive_source.as_deref().map_or_else(
-                || "尚未选择来源".to_string(),
+                || crate::i18n::text("No source selected", "尚未选择来源").to_string(),
                 |path| path.display().to_string(),
             ));
         });
@@ -1835,7 +2181,10 @@ impl PhotoArchiveApp {
             if ui
                 .add_enabled(
                     !self.work_running,
-                    eframe::egui::Button::new("选择输出目录…"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Choose Output Folder…",
+                        "选择输出目录…",
+                    )),
                 )
                 .clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -1847,17 +2196,24 @@ impl PhotoArchiveApp {
                         self.archive_output_directory = Some(path);
                     }
                     Err(error) => {
-                        self.status = format!("无法读取归档输出目录 {}：{error}", path.display());
+                        self.status = crate::tr_format!(
+                            "Could not read archive output folder {}: {error}",
+                            "无法读取归档输出目录 {}：{error}",
+                            path.display()
+                        );
                     }
                 }
             }
             ui.label(self.archive_output_directory.as_deref().map_or_else(
-                || "尚未选择输出目录".to_string(),
+                || crate::i18n::text("No output folder selected", "尚未选择输出目录").to_string(),
                 |path| path.display().to_string(),
             ));
         });
         ui.horizontal(|ui| {
-            ui.label("归档名称（默认日期为 UTC，可修改）");
+            ui.label(crate::i18n::text(
+                "Archive name (default date is UTC; editable)",
+                "归档名称（默认日期为 UTC，可修改）",
+            ));
             if ui
                 .add_enabled(
                     !self.work_running,
@@ -1868,13 +2224,17 @@ impl PhotoArchiveApp {
                 self.archive_name_custom = true;
                 archive_inputs_changed = true;
             }
-            ui.label("（自动补 .7z）");
+            ui.label(crate::i18n::text(
+                "(.7z added automatically)",
+                "（自动补 .7z）",
+            ));
         });
         archive_inputs_changed |= ui
             .add_enabled(
                 !self.work_running,
-                eframe::egui::Slider::new(&mut self.archive_options.volume_mb, 1..=2000)
-                    .text("单卷上限（十进制 MB）"),
+                eframe::egui::Slider::new(&mut self.archive_options.volume_mb, 1..=2000).text(
+                    crate::i18n::text("Maximum volume size (decimal MB)", "单卷上限（十进制 MB）"),
+                ),
             )
             .changed();
         archive_inputs_changed |= ui
@@ -1882,18 +2242,18 @@ impl PhotoArchiveApp {
                 !self.work_running,
                 eframe::egui::Checkbox::new(
                     &mut self.archive_options.strict_restore,
-                    "执行隔离目录还原校验",
+                    crate::i18n::text("Run Isolated Restore Verification", "执行隔离目录还原校验"),
                 ),
             )
             .changed();
         if archive_inputs_changed {
             self.invalidate_pending_archive();
         }
-        ui.weak("2000 MB = 2,000,000,000 字节。密码只用于当前归档任务；不会写入文件名、进程参数或报告。归档采用 Store（不压缩）、AES-256 和加密文件名。");
-        ui.weak("隔离还原校验会将归档内容写入权限受限的临时目录，再重读每个文件并核对 SHA-256；完成后清理，额外临时空间至少需要容纳一份还原内容。");
+        ui.weak(crate::i18n::text("2000 MB = 2,000,000,000 bytes. The password is used only for this archive task; it is not written to the filename, process arguments, or report. The archive uses Store (no compression), AES-256, and encrypted filenames.", "2000 MB = 2,000,000,000 字节。密码只用于当前归档任务；不会写入文件名、进程参数或报告。归档采用 Store（不压缩）、AES-256 和加密文件名。"));
+        ui.weak(crate::i18n::text("Isolated restore verification writes the archive to a restricted temporary folder, rereads every file, and checks SHA-256. The temporary files are cleaned up afterward. Allow extra temporary space at least equal to the restored data.", "隔离还原校验会将归档内容写入权限受限的临时目录，再重读每个文件并核对 SHA-256；完成后清理，额外临时空间至少需要容纳一份还原内容。"));
         if !self.excluded_final_paths.is_empty() {
-            ui.weak(format!(
-                "携带了 {} 个阶段⑥排除标记；归档扫描遇到同一绝对路径时会从输入清单排除。",
+            ui.weak(crate::tr_format!(
+                "Carries {} exclusions from stage ⑥. If the archive scan finds the same absolute path, it will be excluded from the input manifest.", "携带了 {} 个阶段⑥排除标记；归档扫描遇到同一绝对路径时会从输入清单排除。",
                 self.excluded_final_paths.len()
             ));
         }
@@ -1902,34 +2262,40 @@ impl PhotoArchiveApp {
         {
             let count = manifest.file_sha256.len();
             let checkpoint_note = if self.review_checkpoint_saved {
-                "审核决定保存在本机私有检查点。"
+                crate::i18n::text(
+                    "Review decisions are saved in a private local checkpoint.",
+                    "审核决定保存在本机私有检查点。",
+                )
             } else {
-                "审核决定仅在当前运行中可用；检查点未保存。"
+                crate::i18n::text(
+                    "Review decisions are available only in this run; the checkpoint was not saved.",
+                    "审核决定仅在当前运行中可用；检查点未保存。",
+                )
             };
             let mut clear_review = false;
             ui.horizontal_wrapped(|ui| {
-                ui.weak(format!(
-                    "阶段⑥ Final Manifest：只归档其中 {} 个已确认文件，并核对其 SHA-256；{}",
+                ui.weak(crate::tr_format!(
+                    "Stage ⑥ Final Manifest: archive only the {} confirmed files and verify their SHA-256. {}", "阶段⑥ Final Manifest：只归档其中 {} 个已确认文件，并核对其 SHA-256；{}",
                     count, checkpoint_note
                 ));
-                if ui.button("清除审核清单").clicked() {
+                if ui.button(crate::i18n::text("Clear Review Manifest", "清除审核清单")).clicked() {
                     clear_review = true;
                 }
             });
             if clear_review {
                 self.clear_saved_review();
-                self.status = "已清除本机阶段⑥审核清单；归档将按所选目录重新建立输入清单。".into();
+                self.status = crate::i18n::text("Cleared the stage ⑥ review manifest on this device. The archive will build its input manifest by rescanning the selected folder.", "已清除本机阶段⑥审核清单；归档将按所选目录重新建立输入清单。").into();
             }
         }
         ui.horizontal(|ui| {
-            ui.label("密码");
+            ui.label(crate::i18n::text("Password", "密码"));
             ui.add_enabled(
                 !self.work_running,
                 eframe::egui::TextEdit::singleline(&mut self.archive_password)
                     .password(!self.archive_show_password)
                     .desired_width(240.0),
             );
-            ui.label("确认密码");
+            ui.label(crate::i18n::text("Confirm Password", "确认密码"));
             ui.add_enabled(
                 !self.work_running,
                 eframe::egui::TextEdit::singleline(&mut self.archive_confirmation)
@@ -1938,10 +2304,16 @@ impl PhotoArchiveApp {
             );
             ui.add_enabled(
                 !self.work_running,
-                eframe::egui::Checkbox::new(&mut self.archive_show_password, "显示"),
+                eframe::egui::Checkbox::new(
+                    &mut self.archive_show_password,
+                    crate::i18n::text("Show", "显示"),
+                ),
             );
             if ui
-                .add_enabled(!self.work_running, eframe::egui::Button::new("清空密码"))
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new(crate::i18n::text("Clear Password", "清空密码")),
+                )
                 .clicked()
             {
                 self.archive_password.zeroize();
@@ -1958,7 +2330,10 @@ impl PhotoArchiveApp {
                 if ui
                     .add_enabled(
                         !self.work_running && ready,
-                        eframe::egui::Button::new("重新扫描并重建归档"),
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "Rescan and Rebuild Archive",
+                            "重新扫描并重建归档",
+                        )),
                     )
                     .clicked()
                 {
@@ -1967,7 +2342,10 @@ impl PhotoArchiveApp {
                 if ui
                     .add_enabled(
                         !self.work_running,
-                        eframe::egui::Button::new("丢弃恢复记录"),
+                        eframe::egui::Button::new(crate::i18n::text(
+                            "Discard Recovery Record",
+                            "丢弃恢复记录",
+                        )),
                     )
                     .clicked()
                 {
@@ -1976,7 +2354,10 @@ impl PhotoArchiveApp {
             } else if ui
                 .add_enabled(
                     !self.work_running && ready,
-                    eframe::egui::Button::new("创建并验证加密归档"),
+                    eframe::egui::Button::new(crate::i18n::text(
+                        "Create and Verify Encrypted Archive",
+                        "创建并验证加密归档",
+                    )),
                 )
                 .clicked()
             {
@@ -1984,23 +2365,28 @@ impl PhotoArchiveApp {
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Archive)
-                && ui.button("取消归档").clicked()
+                && ui
+                    .button(crate::i18n::text("Cancel Archive", "取消归档"))
+                    .clicked()
                 && let Some(control) = &self.work_control
             {
                 control.cancel();
             }
         });
         if self.pending_archive_resume.is_some() {
-            ui.weak("检测到未完成归档。恢复会重新扫描并从头创建、验证；密码未保存，请重新输入。中断留下的临时文件不会自动删除；若目标归档已存在，程序不会覆盖，请更换名称或先处理残留文件。");
+            ui.weak(crate::i18n::text("An unfinished archive was found. Recovery rescans the source and creates and verifies it from the beginning. The password was not saved; enter it again. Temporary files left by the interruption are not removed automatically. If the destination archive already exists, it will not be overwritten; choose another name or handle the leftover files first.", "检测到未完成归档。恢复会重新扫描并从头创建、验证；密码未保存，请重新输入。中断留下的临时文件不会自动删除；若目标归档已存在，程序不会覆盖，请更换名称或先处理残留文件。"));
         }
         if !self.archive_password.is_empty()
             && !self.archive_confirmation.is_empty()
             && self.archive_password != self.archive_confirmation
         {
-            ui.colored_label(eframe::egui::Color32::DARK_RED, "两次输入的密码不一致。");
+            ui.colored_label(
+                eframe::egui::Color32::DARK_RED,
+                crate::i18n::text("The passwords do not match.", "两次输入的密码不一致。"),
+            );
         }
         if !self.status.is_empty() {
-            ui.label(&self.status);
+            ui.label(i18n::localize_dynamic(self.language, &self.status));
         }
     }
 
@@ -2012,11 +2398,19 @@ impl PhotoArchiveApp {
             self.archive_source.clone(),
             self.archive_output_directory.clone(),
         ) else {
-            self.status = "请先选择归档来源文件夹和输出目录。".into();
+            self.status = crate::i18n::text(
+                "Choose an archive source folder and an output folder first.",
+                "请先选择归档来源文件夹和输出目录。",
+            )
+            .into();
             return;
         };
         if self.archive_password.is_empty() || self.archive_password != self.archive_confirmation {
-            self.status = "归档密码不能为空，且两次输入必须一致。".into();
+            self.status = crate::i18n::text(
+                "The archive password cannot be empty, and both entries must match.",
+                "归档密码不能为空，且两次输入必须一致。",
+            )
+            .into();
             return;
         }
         let name = self.archive_name.trim().to_string();
@@ -2030,7 +2424,10 @@ impl PhotoArchiveApp {
         };
         let was_resume = self.pending_archive_resume.is_some();
         if let Err(error) = checkpoint::save_pending_archive(&plan) {
-            self.status = format!("无法保存归档恢复检查点，未开始归档：{error}");
+            self.status = crate::tr_format!(
+                "Could not save the archive recovery checkpoint; archiving did not start: {error}",
+                "无法保存归档恢复检查点，未开始归档：{error}"
+            );
             return;
         }
         self.pending_archive_resume = Some(plan);
@@ -2051,9 +2448,17 @@ impl PhotoArchiveApp {
         self.work_kind = Some(WorkKind::Archive);
         self.work_running = true;
         self.status = if was_resume {
-            "正在重新扫描来源并从头重建、验证加密归档…".into()
+            crate::i18n::text(
+                "Rescanning the source and rebuilding and verifying the encrypted archive…",
+                "正在重新扫描来源并从头重建、验证加密归档…",
+            )
+            .into()
         } else {
-            "正在扫描、建立哈希清单并创建临时加密归档…".into()
+            crate::i18n::text(
+                "Scanning, creating the hash manifest, and building a temporary encrypted archive…",
+                "正在扫描、建立哈希清单并创建临时加密归档…",
+            )
+            .into()
         };
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
@@ -2109,7 +2514,10 @@ impl PhotoArchiveApp {
                 if resume_existing {
                     self.pending_backup_resume = Some(mappings);
                 }
-                self.status = format!("无法保存备份恢复检查点，未开始备份：{error}");
+                self.status = crate::tr_format!(
+                    "Could not save the backup recovery checkpoint; backup did not start: {error}",
+                    "无法保存备份恢复检查点，未开始备份：{error}"
+                );
                 return;
             }
         }
@@ -2123,11 +2531,23 @@ impl PhotoArchiveApp {
         self.work_kind = Some(WorkKind::Backup);
         self.work_running = true;
         self.status = if verify_only {
-            "正在重新扫描源目录与现有备份目标…".into()
+            crate::i18n::text(
+                "Rescanning source folders and existing backup destinations…",
+                "正在重新扫描源目录与现有备份目标…",
+            )
+            .into()
         } else if resume_existing {
-            "正在重新扫描备份来源并续跑；已有目标会重新校验…".into()
+            crate::i18n::text(
+                "Rescanning backup sources and resuming; existing destinations will be verified…",
+                "正在重新扫描备份来源并续跑；已有目标会重新校验…",
+            )
+            .into()
         } else {
-            "正在扫描本地整理目录并准备独立备份目标…".into()
+            crate::i18n::text(
+                "Scanning organized folders and preparing separate backup destinations…",
+                "正在扫描本地整理目录并准备独立备份目标…",
+            )
+            .into()
         };
         let excluded = self.excluded_final_paths.clone();
         let final_manifest = self.final_manifest.clone();
@@ -2177,7 +2597,8 @@ impl PhotoArchiveApp {
                 if summary.error_count > 0 {
                     append_task_error(
                         &mut error,
-                        format!(
+                        crate::tr_format!(
+                            "Scanning {}: {} read errors (for example, {})",
                             "扫描 {} 时有 {} 项读取错误（例如 {}）",
                             source.display(),
                             summary.error_count,
@@ -2185,7 +2606,7 @@ impl PhotoArchiveApp {
                                 .error_samples
                                 .first()
                                 .map(String::as_str)
-                                .unwrap_or("未提供")
+                                .unwrap_or(crate::i18n::text("Not provided", "未提供"))
                         ),
                     );
                 }
@@ -2203,7 +2624,10 @@ impl PhotoArchiveApp {
                     if missing > 0 {
                         append_task_error(
                             &mut error,
-                            format!("最终清单中有 {missing} 个文件已不存在或无法扫描"),
+                            crate::tr_format!(
+                                "{missing} files in the final manifest no longer exist or could not be scanned",
+                                "最终清单中有 {missing} 个文件已不存在或无法扫描"
+                            ),
                         );
                     }
                 }
@@ -2252,8 +2676,8 @@ impl PhotoArchiveApp {
                     verification: Vec::new(),
                     cancelled: false,
                     error: Some(match error {
-                        Some(error) => format!("{error}；没有可备份文件。"),
-                        None => "没有可备份文件；请检查来源目录、最终清单和阶段⑥排除标记。".into(),
+                        Some(error) => crate::tr_format!("{error}; no files are available to back up.", "{error}；没有可备份文件。"),
+                        None => crate::i18n::text("No files are available to back up. Check the source folders, final manifest, and stage ⑥ exclusions.", "没有可备份文件；请检查来源目录、最终清单和阶段⑥排除标记。").into(),
                     }),
                     verify_only,
                 });
@@ -2262,13 +2686,19 @@ impl PhotoArchiveApp {
             if excluded_count > 0 {
                 append_task_error(
                     &mut error,
-                    format!("按阶段⑥决定排除了 {excluded_count} 个目标文件项"),
+                    crate::tr_format!(
+                        "Excluded {excluded_count} destination file item(s) based on stage ⑥ decisions",
+                        "按阶段⑥决定排除了 {excluded_count} 个目标文件项"
+                    ),
                 );
             }
             if manifest_filtered_count > 0 {
                 append_task_error(
                     &mut error,
-                    format!("最终清单之外的 {manifest_filtered_count} 个目标文件项未备份"),
+                    crate::tr_format!(
+                        "Did not back up {manifest_filtered_count} destination file item(s) outside the final manifest",
+                        "最终清单之外的 {manifest_filtered_count} 个目标文件项未备份"
+                    ),
                 );
             }
             let item_count = items.len();
@@ -2301,7 +2731,7 @@ impl PhotoArchiveApp {
                     });
                     if changed {
                         item.result =
-                            Err("源文件 SHA-256 与阶段⑥最终清单不符；请重新检查重复项。".into());
+                            Err(crate::i18n::text("The source file’s SHA-256 does not match the stage ⑥ final manifest. Review the duplicates again.", "源文件 SHA-256 与阶段⑥最终清单不符；请重新检查重复项。").into());
                     }
                 }
                 let mut verification = verification;
@@ -2374,7 +2804,9 @@ impl PhotoArchiveApp {
             return;
         }
         let Some(root) = self.duplicate_directory.clone() else {
-            self.status = "请先选择待检查目录。".into();
+            self.status =
+                crate::i18n::text("Choose a folder to review first.", "请先选择待检查目录。")
+                    .into();
             return;
         };
         self.metadata_previous_results.clear();
@@ -2385,7 +2817,11 @@ impl PhotoArchiveApp {
         self.work_bytes = 0;
         self.work_kind = Some(WorkKind::Duplicates);
         self.work_running = true;
-        self.status = "正在重新扫描目录并读取拍摄元数据…".into();
+        self.status = crate::i18n::text(
+            "Rescanning the folder and reading capture metadata…",
+            "正在重新扫描目录并读取拍摄元数据…",
+        )
+        .into();
         let threshold = self.duplicate_options.time_threshold_seconds;
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
@@ -2422,8 +2858,13 @@ impl PhotoArchiveApp {
                 .into_iter()
                 .map(|file| file.path)
                 .collect::<Vec<_>>();
-            let mut error = (summary.error_count > 0)
-                .then(|| format!("目录扫描有 {} 项无法读取。", summary.error_count));
+            let mut error = (summary.error_count > 0).then(|| {
+                crate::tr_format!(
+                    "{} items could not be read during the folder scan.",
+                    "目录扫描有 {} 项无法读取。",
+                    summary.error_count
+                )
+            });
             let _ = sender.send(WorkMessage::DuplicateProgress {
                 completed: 0,
                 total: paths.len(),
@@ -2446,9 +2887,15 @@ impl PhotoArchiveApp {
                     Err(metadata_error) => {
                         error = Some(match error {
                             Some(scan_error) => {
-                                format!("{scan_error} 元数据不可用：{metadata_error}")
+                                crate::tr_format!(
+                                    "{scan_error} Metadata unavailable: {metadata_error}",
+                                    "{scan_error} 元数据不可用：{metadata_error}"
+                                )
                             }
-                            None => format!("拍摄时间不可用：{metadata_error}"),
+                            None => crate::tr_format!(
+                                "Capture time unavailable: {metadata_error}",
+                                "拍摄时间不可用：{metadata_error}"
+                            ),
                         });
                         paths
                             .iter()
@@ -2489,7 +2936,11 @@ impl PhotoArchiveApp {
                 self.candidate_preview_receiver = None;
                 self.candidate_preview_loading = false;
                 if self.candidate_preview_paths.is_some() {
-                    let error = "预览任务意外结束，请重新打开预览。".to_string();
+                    let error = crate::i18n::text(
+                        "The preview task ended unexpectedly. Open the preview again.",
+                        "预览任务意外结束，请重新打开预览。",
+                    )
+                    .to_string();
                     self.candidate_preview_textures = Some((Err(error.clone()), Err(error)));
                 }
             }
@@ -2499,21 +2950,27 @@ impl PhotoArchiveApp {
             return;
         };
         let mut open = true;
-        eframe::egui::Window::new("候选照片并排预览")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(960.0)
-            .show(ctx, |ui| {
-                if let Some((first_texture, second_texture)) = &self.candidate_preview_textures {
-                    ui.horizontal_top(|ui| {
-                        show_candidate_preview(ui, &first_path, first_texture);
-                        show_candidate_preview(ui, &second_path, second_texture);
-                    });
-                } else {
-                    ui.spinner();
-                    ui.label("正在读取图片并生成预览…");
-                }
-            });
+        eframe::egui::Window::new(crate::i18n::text(
+            "Side-by-Side Candidate Preview",
+            "候选照片并排预览",
+        ))
+        .open(&mut open)
+        .resizable(true)
+        .default_width(960.0)
+        .show(ctx, |ui| {
+            if let Some((first_texture, second_texture)) = &self.candidate_preview_textures {
+                ui.horizontal_top(|ui| {
+                    show_candidate_preview(ui, &first_path, first_texture);
+                    show_candidate_preview(ui, &second_path, second_texture);
+                });
+            } else {
+                ui.spinner();
+                ui.label(crate::i18n::text(
+                    "Reading images and generating previews…",
+                    "正在读取图片并生成预览…",
+                ));
+            }
+        });
         if !open {
             self.clear_candidate_preview();
         }
@@ -2549,7 +3006,7 @@ impl PhotoArchiveApp {
             .map(|item| item.destination.clone())
             .collect();
         if paths.is_empty() {
-            self.status = "没有本次成功复制的目标文件；请选择当前整理目录。".into();
+            self.status = crate::i18n::text("No successfully copied target files in this session. Choose the current organized folder.", "没有本次成功复制的目标文件；请选择当前整理目录。").into();
             return;
         }
         self.start_metadata(MetadataInput::Files(paths));
@@ -2557,7 +3014,11 @@ impl PhotoArchiveApp {
 
     fn start_metadata_for_directory(&mut self) {
         let Some(path) = self.metadata_directory.clone() else {
-            self.status = "请先选择当前整理目录。".into();
+            self.status = crate::i18n::text(
+                "Choose the current organized folder first.",
+                "请先选择当前整理目录。",
+            )
+            .into();
             return;
         };
         self.start_metadata(MetadataInput::Directory(path));
@@ -2575,7 +3036,11 @@ impl PhotoArchiveApp {
         self.work_bytes = 0;
         self.work_kind = Some(WorkKind::Metadata);
         self.work_running = true;
-        self.status = "正在准备 ExifTool 元数据检查…".into();
+        self.status = crate::i18n::text(
+            "Preparing ExifTool metadata review…",
+            "正在准备 ExifTool 元数据检查…",
+        )
+        .into();
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -2594,14 +3059,14 @@ impl PhotoArchiveApp {
                     match scan {
                         Ok(summary) => {
                             let warning = (summary.error_count > 0).then(|| {
-                                format!(
-                                    "目录扫描有 {} 项无法读取；示例：{}",
+                                crate::tr_format!(
+                                    "{} items could not be read during the folder scan. Example: {}", "目录扫描有 {} 项无法读取；示例：{}",
                                     summary.error_count,
                                     summary
                                         .error_samples
                                         .first()
                                         .map(String::as_str)
-                                        .unwrap_or("未提供")
+                                        .unwrap_or(crate::i18n::text("Not provided", "未提供"))
                                 )
                             });
                             (
@@ -2716,7 +3181,10 @@ impl PhotoArchiveApp {
             if resume_existing {
                 self.pending_copy_resume = Some(items);
             }
-            self.status = format!("无法保存文件复制恢复检查点，未开始复制：{error}");
+            self.status = crate::tr_format!(
+                "Could not save the copy recovery checkpoint; copying did not start: {error}",
+                "无法保存文件复制恢复检查点，未开始复制：{error}"
+            );
             return;
         }
         self.invalidate_after_copy_change();
@@ -2729,7 +3197,11 @@ impl PhotoArchiveApp {
         self.work_bytes = 0;
         self.work_kind = Some(WorkKind::Copy);
         self.work_running = true;
-        self.status = format!("正在安全复制 {} 个文件…", items.len());
+        self.status = crate::tr_format!(
+            "Safely copying {} files…",
+            "正在安全复制 {} 个文件…",
+            items.len()
+        );
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -2765,7 +3237,11 @@ impl PhotoArchiveApp {
             .map(|item| (item.source.clone(), item.destination.clone()))
             .collect();
         if pairs.is_empty() {
-            self.status = "没有成功复制的文件可供校验。".into();
+            self.status = crate::i18n::text(
+                "No successfully copied files are available to verify.",
+                "没有成功复制的文件可供校验。",
+            )
+            .into();
             return;
         }
         self.verify_results.clear();
@@ -2775,7 +3251,11 @@ impl PhotoArchiveApp {
         self.work_bytes = 0;
         self.work_kind = Some(WorkKind::Verify);
         self.work_running = true;
-        self.status = format!("正在重新读取并校验 {} 对文件…", pairs.len());
+        self.status = crate::tr_format!(
+            "Rereading and verifying {} file pairs…",
+            "正在重新读取并校验 {} 对文件…",
+            pairs.len()
+        );
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -2804,11 +3284,15 @@ impl PhotoArchiveApp {
             self.direct_verify_source.clone(),
             self.direct_verify_target.clone(),
         ) else {
-            self.status = "请先选择源目录和目标目录。".into();
+            self.status = crate::i18n::text(
+                "Choose source and destination folders first.",
+                "请先选择源目录和目标目录。",
+            )
+            .into();
             return;
         };
         if source_root.starts_with(&target_root) || target_root.starts_with(&source_root) {
-            self.status = "独立校验的源和目标目录不能相同或互相嵌套；请选择互不重叠的目录。".into();
+            self.status = crate::i18n::text("Independent verification source and destination folders cannot be the same or nested. Choose folders that do not overlap.", "独立校验的源和目标目录不能相同或互相嵌套；请选择互不重叠的目录。").into();
             return;
         }
         self.verify_results.clear();
@@ -2818,7 +3302,11 @@ impl PhotoArchiveApp {
         self.work_bytes = 0;
         self.work_kind = Some(WorkKind::Verify);
         self.work_running = true;
-        self.status = "正在独立扫描并核对源目录与目标目录…".into();
+        self.status = crate::i18n::text(
+            "Independently scanning and comparing the source and destination folders…",
+            "正在独立扫描并核对源目录与目标目录…",
+        )
+        .into();
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -2917,7 +3405,8 @@ impl PhotoArchiveApp {
                     if !cancelled && self.copy_results.iter().all(|item| item.result.is_ok()) {
                         self.pending_copy_resume = None;
                         if let Err(error) = checkpoint::clear_pending_copy() {
-                            self.status = format!(
+                            self.status = crate::tr_format!(
+                                "Copy finished, but the recovery checkpoint could not be cleared: {error}. Existing destinations will be checked again at next launch.",
                                 "复制已完成，但无法清除恢复检查点：{error}。下次启动时会重新核对已存在目标。"
                             );
                         }
@@ -2940,16 +3429,21 @@ impl PhotoArchiveApp {
                         .count();
                     let failed = self.copy_results.len() - passed;
                     if cancelled {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Copy stopped: {passed} completed, {failed} failed; remaining items were not started. The recovery plan was saved. Resume after relaunch and verify existing destinations.",
                             "复制已停止：完成 {passed}，失败 {failed}；剩余项目未开始。恢复计划已保存，可在重启后继续并复核已存在目标。"
                         );
                         self.apply_pending_stage();
                     } else {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Copy stage ended: {passed} succeeded, {failed} failed. Source files were not modified.",
                             "复制阶段结束：成功 {passed}，失败 {failed}。来源文件未修改。 "
                         );
-                        self.handoff_title = "分类复制已完成".into();
-                        self.handoff_description = format!(
+                        self.handoff_title =
+                            crate::i18n::text("Routing and copy completed", "分类复制已完成")
+                                .into();
+                        self.handoff_description = crate::tr_format!(
+                            "This stage produced {} copy results: {} succeeded, {} failed. Unfinished copy plans are saved in a private local checkpoint. Resume after the next launch; existing targets are reread and verified. The next stage rereads sources and targets to calculate SHA-256.",
                             "本阶段产生 {} 项复制结果，成功 {} 项、失败 {} 项。未完成复制计划保存在本机私有检查点；下次启动可选择恢复，已有目标会重新读取并校验。下一阶段仍会重新读取源和目标文件计算 SHA-256。",
                             self.copy_results.len(),
                             passed,
@@ -2984,7 +3478,8 @@ impl PhotoArchiveApp {
                         .count();
                     let failed = self.verify_results.len() - matching;
                     if cancelled {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Verification canceled: {} completed, {} matched.",
                             "校验已取消：完成 {} 项，一致 {} 项。",
                             self.verify_results.len(),
                             matching
@@ -2998,12 +3493,18 @@ impl PhotoArchiveApp {
                                 && coverage.source_count == coverage.target_count
                         });
                         let passed = failed == 0 && coverage_pass;
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Verification complete: {}; {matching} matched, {failed} mismatched or could not be read.",
                             "校验完成：{}；一致 {matching} 项，不一致或读取失败 {failed} 项。",
                             if passed { "PASS" } else { "FAIL" }
                         );
-                        self.handoff_title = "完整性校验已完成".into();
-                        self.handoff_description = format!(
+                        self.handoff_title = crate::i18n::text(
+                            "Integrity verification completed",
+                            "完整性校验已完成",
+                        )
+                        .into();
+                        self.handoff_description = crate::tr_format!(
+                            "Reread {} source/target pairs and compared size and SHA-256; {} matched, {} mismatched or could not be read.",
                             "已重新读取 {} 对源/目标文件并比较大小与 SHA-256；一致 {} 项，不一致或读取失败 {} 项。",
                             self.verify_results.len(),
                             matching,
@@ -3077,19 +3578,24 @@ impl PhotoArchiveApp {
                     );
 
                     if cancelled {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Metadata review canceled: {} completed; unreviewed items can be run again.",
                             "元数据检查已取消：已完成 {} 项；未检查项目可重新运行。",
                             self.metadata_results.len()
                         );
                         self.apply_pending_stage();
                     } else if self.metadata_results.is_empty() && error.is_some() {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Metadata review could not start: {}",
                             "元数据检查未能启动：{}",
-                            error.as_deref().unwrap_or("未知错误")
+                            error
+                                .as_deref()
+                                .unwrap_or(crate::i18n::text("Unknown error", "未知错误"))
                         );
                         self.apply_pending_stage();
                     } else {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Metadata review complete: {} PASS, {} warnings ({} accepted), {} read errors. {}",
                             "元数据检查完成：{} 项 PASS，{} 项警告（已接受 {} 项），{} 项读取错误。{}",
                             passed,
                             warnings,
@@ -3097,8 +3603,11 @@ impl PhotoArchiveApp {
                             read_errors,
                             error.as_deref().unwrap_or("")
                         );
-                        self.handoff_title = "元数据检查已完成".into();
-                        self.handoff_description = format!(
+                        self.handoff_title =
+                            crate::i18n::text("Metadata review completed", "元数据检查已完成")
+                                .into();
+                        self.handoff_description = crate::tr_format!(
+                            "Read real metadata for {} current files individually: {} had valid GPS and capture time; {} warnings ({} accepted); {} read errors. EXIF, GPS, and capture-time results remain in memory for this session only. {}",
                             "已逐项读取 {} 个当前文件的真实元数据：GPS 与拍摄时间均有效 {} 项；警告 {} 项（用户已接受 {} 项）；读取错误 {} 项。EXIF、GPS 和拍摄时间结果只保留在本次会话内存中。{}",
                             self.metadata_results.len(),
                             passed,
@@ -3129,16 +3638,27 @@ impl PhotoArchiveApp {
                     let hash_errors = report.hash_errors.len();
                     self.duplicate_report = Some(report);
                     if cancelled {
-                        self.status = "重复检查已取消；未完成的文件需重新扫描。".into();
+                        self.status = crate::i18n::text(
+                            "Duplicate review canceled. Files not completed must be rescanned.",
+                            "重复检查已取消；未完成的文件需重新扫描。",
+                        )
+                        .into();
                         self.apply_pending_stage();
                     } else {
                         let warning = error.unwrap_or_default();
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Duplicate review found {} exact groups, {} time candidates, and {} SHA-256 read errors. {}",
                             "重复检查完成：{} 个精确重复组，{} 个时间候选，{} 个 SHA-256 读取错误。{}",
-                            exact_groups, candidates, hash_errors, warning
+                            exact_groups,
+                            candidates,
+                            hash_errors,
+                            warning
                         );
-                        self.handoff_title = "重复检查已完成".into();
-                        self.handoff_description = format!(
+                        self.handoff_title =
+                            crate::i18n::text("Duplicate review completed", "重复检查已完成")
+                                .into();
+                        self.handoff_description = crate::tr_format!(
+                            "Rescanned and reviewed the folder. Found {} byte-identical groups, {} time candidates, and {} SHA-256 read errors. When carried forward, paths with a successfully computed SHA-256 and no exclusion form the Final Manifest. Paths, hashes, and exclusions are saved in a private local checkpoint. Review decisions can be restored after relaunch; stages ⑦/⑧ still rescan and verify contents. {} items are currently excluded by manual review; files on disk are not deleted. {}",
                             "本轮重新扫描并检查了目录。发现 {} 个字节完全相同组、{} 个时间候选、{} 个 SHA-256 读取错误。携带时会把成功计算 SHA-256 且未排除的路径组成 Final Manifest，并将路径、哈希和排除决定保存到本机私有检查点；重启后可恢复审核决定，阶段⑦/⑧仍会重新扫描并核对内容。当前人工排除标记共 {} 项；不会删除磁盘文件。{}",
                             exact_groups,
                             candidates,
@@ -3185,7 +3705,8 @@ impl PhotoArchiveApp {
                         } else {
                             self.pending_backup_resume = None;
                             if let Err(error) = checkpoint::clear_pending_backup() {
-                                self.status = format!(
+                                self.status = crate::tr_format!(
+                                    "Backup finished, but the recovery checkpoint could not be cleared: {error}. The destinations will be rescanned and verified next time.",
                                     "备份已完成，但无法清除恢复检查点：{error}。下次启动会重新扫描并核对目标。"
                                 );
                             }
@@ -3204,26 +3725,34 @@ impl PhotoArchiveApp {
                     self.backup_verification = verification;
                     let warning = error.unwrap_or_default();
                     if cancelled {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Backup canceled: {copied} copied, {copy_failed} failed; read-back verification {verified} PASS, {verify_failed} FAIL. Recovery info was saved; rescan and resume next time. {warning}",
                             "备份已取消：复制成功 {copied} 项、失败 {copy_failed} 项；读回校验 PASS {verified} 项、FAIL {verify_failed} 项。恢复记录已保存，下次可重新扫描并继续。{warning}"
                         );
                         self.apply_pending_stage();
                     } else if verify_only {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Backup recheck complete: {verified} PASS, {verify_failed} FAIL. {warning}",
                             "备份重新检查完成：PASS {verified} 项，FAIL {verify_failed} 项。{warning}"
                         );
-                        self.handoff_title = "备份重新检查已完成".into();
-                        self.handoff_description = format!(
+                        self.handoff_title =
+                            crate::i18n::text("Backup recheck completed", "备份重新检查已完成")
+                                .into();
+                        self.handoff_description = crate::tr_format!(
+                            "Rescanned the selected local folders and destinations, and reread {} source/destination SHA-256 values. {verified} PASS, {verify_failed} FAIL. {warning}",
                             "已重新扫描所选本地目录和目标，并重新读取 {} 项源/目标 SHA-256。PASS {verified} 项、FAIL {verify_failed} 项。{warning}",
                             self.backup_verification.len()
                         );
                         self.show_handoff = !self.apply_pending_stage();
                     } else {
-                        self.status = format!(
+                        self.status = crate::tr_format!(
+                            "Backup completed: {copied} copied, {copy_failed} failed; independent read-back verification {verified} PASS, {verify_failed} FAIL. {warning}",
                             "备份完成：复制成功 {copied} 项、失败 {copy_failed} 项；独立读回校验 PASS {verified} 项、FAIL {verify_failed} 项。{warning}"
                         );
-                        self.handoff_title = "文件备份已完成".into();
-                        self.handoff_description = format!(
+                        self.handoff_title =
+                            crate::i18n::text("Backup completed", "文件备份已完成").into();
+                        self.handoff_description = crate::tr_format!(
+                            "Each selected backup destination received a copy and a file-by-file SHA-256 read-back check: {copied} copied, {copy_failed} failed; verification {verified} PASS, {verify_failed} FAIL. Unfinished mappings are saved in a private local checkpoint; rescan the sources and verify existing destinations next time. {warning}",
                             "各所选备份目标分别执行了复制和逐文件 SHA-256 读回验证：复制成功 {copied} 项、失败 {copy_failed} 项；校验 PASS {verified} 项、FAIL {verify_failed} 项。未完成映射会保存在本机私有检查点；下次可重新扫描源并校验已有目标。{warning}"
                         );
                         self.show_handoff = !self.apply_pending_stage();
@@ -3251,14 +3780,24 @@ impl PhotoArchiveApp {
                                     self.pending_archive_resume = None;
                                     String::new()
                                 }
-                                Err(error) => format!("归档完成，但无法清理恢复记录：{error}。"),
+                                Err(error) => crate::tr_format!(
+                                    "Archive finished, but the recovery record could not be cleared: {error}.",
+                                    "归档完成，但无法清理恢复记录：{error}。"
+                                ),
                             };
-                            self.status = format!(
+                            self.status = crate::tr_format!(
+                                "Archive completed and passed {}: {} files, {} volumes, input {}, archive {}. {}{}",
                                 "归档完成并通过{}：{} 个文件，{} 卷，输入 {}，归档 {}。{}{}",
                                 if result.strict_restore_verified {
-                                    "隔离目录还原与逐文件 SHA-256 重读"
+                                    crate::i18n::text(
+                                        "Isolated Restore and File-by-File SHA-256 Read-Back",
+                                        "隔离目录还原与逐文件 SHA-256 重读",
+                                    )
                                 } else {
-                                    "流式解码与逐文件 SHA-256 校验"
+                                    crate::i18n::text(
+                                        "Streamed Decode and File-by-File SHA-256 Verification",
+                                        "流式解码与逐文件 SHA-256 校验",
+                                    )
                                 },
                                 result.file_count,
                                 result.volume_count,
@@ -3267,13 +3806,22 @@ impl PhotoArchiveApp {
                                 result.cleanup_warning.as_deref().unwrap_or(""),
                                 recovery_warning
                             );
-                            self.handoff_title = "加密归档已完成".into();
-                            self.handoff_description = format!(
+                            self.handoff_title =
+                                crate::i18n::text("Encrypted archive completed", "加密归档已完成")
+                                    .into();
+                            self.handoff_description = crate::tr_format!(
+                                "Completed {}, and committed the volume set without overwriting: {}. Files verified {}; input {}; total archive size {}. These volumes form one logical 7z archive. {}{}",
                                 "已完成{}，并防覆盖提交卷集：{}。验证文件 {} 项；输入 {}；总归档大小 {}。这套卷对应一个逻辑 7z 归档。{}{}",
                                 if result.strict_restore_verified {
-                                    "隔离目录还原和逐文件 SHA-256 重读校验"
+                                    crate::i18n::text(
+                                        "Isolated Restore and File-by-File SHA-256 Verification",
+                                        "隔离目录还原和逐文件 SHA-256 重读校验",
+                                    )
                                 } else {
-                                    "内存流式读取和逐文件 SHA-256 校验"
+                                    crate::i18n::text(
+                                        "In-Memory Streaming and File-by-File SHA-256 Verification",
+                                        "内存流式读取和逐文件 SHA-256 校验",
+                                    )
                                 },
                                 result
                                     .volume_paths
@@ -3291,9 +3839,15 @@ impl PhotoArchiveApp {
                         }
                         Err(error) => {
                             self.status = if cancelled {
-                                format!("归档已取消，临时文件已清理（如可访问）：{error}")
+                                crate::tr_format!(
+                                    "Archive canceled; temporary files were cleaned up if accessible: {error}",
+                                    "归档已取消，临时文件已清理（如可访问）：{error}"
+                                )
                             } else {
-                                format!("归档未提交：{error}")
+                                crate::tr_format!(
+                                    "Archive not committed: {error}",
+                                    "归档未提交：{error}"
+                                )
                             };
                             self.apply_pending_stage();
                         }
@@ -3312,7 +3866,7 @@ impl PhotoArchiveApp {
                     self.work_kind = None;
                     self.work_receiver = None;
                     self.work_control = None;
-                    self.status = "后台处理意外结束；请检查结果并重新运行。".into();
+                    self.status = crate::i18n::text("Background processing ended unexpectedly. Check the results and run again.", "后台处理意外结束；请检查结果并重新运行。").into();
                     break;
                 }
             }
@@ -3322,7 +3876,7 @@ impl PhotoArchiveApp {
     fn footer(&mut self, ui: &mut eframe::egui::Ui, ctx: &eframe::egui::Context) {
         ui.add_enabled_ui(!self.pending_pause_switch, |ui| {
             ui.horizontal(|ui| {
-                for (index, label) in STAGES.iter().enumerate() {
+                for (index, label) in stage_names().iter().enumerate() {
                     let marker = if index == self.stage { "●" } else { "○" };
                     if ui
                         .selectable_label(
@@ -3334,7 +3888,10 @@ impl PhotoArchiveApp {
                         self.request_stage(index);
                     }
                 }
-                if ui.button("开源许可").clicked() {
+                if ui
+                    .button(crate::i18n::text("Open-Source Licenses", "开源许可"))
+                    .clicked()
+                {
                     self.show_licenses = true;
                 }
             });
@@ -3348,13 +3905,15 @@ impl PhotoArchiveApp {
                     .as_ref()
                     .is_some_and(TaskControl::is_paused);
                 ui.label(if paused {
-                    format!(
+                    crate::tr_format!(
+                        "Stage task: scan paused · {} files found / {}",
                         "阶段任务：扫描暂停中 · 已发现 {} 个文件 / {}",
                         self.scan_progress.files,
                         format_bytes(self.scan_progress.bytes)
                     )
                 } else {
-                    format!(
+                    crate::tr_format!(
+                        "Stage task: {} files found / {}",
                         "阶段任务：已发现 {} 个文件 / {}",
                         self.scan_progress.files,
                         format_bytes(self.scan_progress.bytes)
@@ -3363,60 +3922,102 @@ impl PhotoArchiveApp {
             } else if self.work_running {
                 ui.spinner();
                 if self.pending_pause_switch {
-                    ui.label("等待当前文件到达安全边界…");
+                    ui.label(crate::i18n::text(
+                        "Waiting for the current file to reach a safe boundary…",
+                        "等待当前文件到达安全边界…",
+                    ));
                 } else if self
                     .work_control
                     .as_ref()
                     .is_some_and(TaskControl::is_paused)
                 {
-                    ui.label("任务暂停中（在安全处理边界生效）。");
+                    ui.label(crate::i18n::text(
+                        "Task paused (at a safe processing boundary).",
+                        "任务暂停中（在安全处理边界生效）。",
+                    ));
                 }
                 let operation = match self.work_kind {
-                    Some(WorkKind::Copy) => format!(
+                    Some(WorkKind::Copy) => crate::tr_format!(
+                        "Copying {} / {} items, {} written",
                         "复制 {} / {} 项，已写入 {}",
                         self.work_completed,
                         self.work_total,
                         format_bytes(self.work_bytes)
                     ),
                     Some(WorkKind::Verify) => {
-                        format!("校验 {} / {} 项", self.work_completed, self.work_total)
+                        crate::tr_format!(
+                            "Verifying {} / {} items",
+                            "校验 {} / {} 项",
+                            self.work_completed,
+                            self.work_total
+                        )
                     }
-                    Some(WorkKind::Metadata) => format!(
+                    Some(WorkKind::Metadata) => crate::tr_format!(
+                        "Reading metadata {} / {} items",
                         "读取元数据 {} / {} 项",
-                        self.work_completed, self.work_total
+                        self.work_completed,
+                        self.work_total
                     ),
                     Some(WorkKind::Duplicates) => {
-                        format!("重复检查 {} / {} 项", self.work_completed, self.work_total)
+                        crate::tr_format!(
+                            "Reviewing duplicates {} / {} items",
+                            "重复检查 {} / {} 项",
+                            self.work_completed,
+                            self.work_total
+                        )
                     }
-                    Some(WorkKind::Backup) => format!(
+                    Some(WorkKind::Backup) => crate::tr_format!(
+                        "Copying and verifying {} / {} items, {} written",
                         "复制并校验 {} / {} 项，已写入 {}",
                         self.work_completed,
                         self.work_total,
                         format_bytes(self.work_bytes)
                     ),
-                    Some(WorkKind::Archive) => format!(
+                    Some(WorkKind::Archive) => crate::tr_format!(
+                        "Archiving and verifying {} / {} items, {} processed",
                         "归档与验证 {} / {} 项，已处理 {}",
                         self.work_completed,
                         self.work_total,
                         format_bytes(self.work_bytes)
                     ),
-                    None => "准备阶段任务…".into(),
+                    None => crate::i18n::text("Preparing stage task…", "准备阶段任务…").into(),
                 };
-                ui.label(format!("阶段任务：{operation}"));
+                ui.label(crate::tr_format!(
+                    "Stage task: {operation}",
+                    "阶段任务：{operation}"
+                ));
             } else if self.pending_copy_resume.is_some() {
-                ui.label("阶段状态：发现可恢复的分类复制任务");
+                ui.label(crate::i18n::text(
+                    "Stage status: unfinished routing copy can be resumed",
+                    "阶段状态：发现可恢复的分类复制任务",
+                ));
             } else if self.pending_backup_resume.is_some() {
-                ui.label("阶段状态：发现可恢复的备份任务");
+                ui.label(crate::i18n::text(
+                    "Stage status: unfinished backup can be resumed",
+                    "阶段状态：发现可恢复的备份任务",
+                ));
             } else if self.last_scan.is_some() {
-                ui.label("阶段状态：已扫描（来源文件清单保存在当前会话内存中）");
+                ui.label(crate::i18n::text(
+                    "Stage status: scanned (source manifest is kept in this session’s memory)",
+                    "阶段状态：已扫描（来源文件清单保存在当前会话内存中）",
+                ));
             } else {
-                ui.label("阶段状态：未开始");
+                ui.label(crate::i18n::text(
+                    "Stage status: not started",
+                    "阶段状态：未开始",
+                ));
             }
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
                     if self.pending_pause_switch {
-                        ui.add_enabled(false, eframe::egui::Button::new("等待安全边界…"));
+                        ui.add_enabled(
+                            false,
+                            eframe::egui::Button::new(crate::i18n::text(
+                                "Waiting for a safe boundary…",
+                                "等待安全边界…",
+                            )),
+                        );
                     } else if (self.scanning || self.work_running)
                         && let Some(control) =
                             self.cancel_scan.as_ref().or(self.work_control.as_ref())
@@ -3424,9 +4025,9 @@ impl PhotoArchiveApp {
                         let paused = control.is_paused();
                         if ui
                             .button(if paused {
-                                "恢复任务"
+                                crate::i18n::text("Resume Task", "恢复任务")
                             } else {
-                                "暂停任务"
+                                crate::i18n::text("Pause Task", "暂停任务")
                             })
                             .clicked()
                         {
@@ -3434,20 +4035,35 @@ impl PhotoArchiveApp {
                         }
                     }
                     ui.add_enabled_ui(!self.pending_pause_switch, |ui| {
-                        if ui.button("下一阶段 →").clicked() {
-                            self.request_stage((self.stage + 1).min(STAGES.len() - 1));
+                        if ui
+                            .button(crate::i18n::text("Next Stage →", "下一阶段 →"))
+                            .clicked()
+                        {
+                            self.request_stage((self.stage + 1).min(8 - 1));
                         }
-                        if ui.button("← 上一阶段").clicked() {
+                        if ui
+                            .button(crate::i18n::text("← Previous Stage", "← 上一阶段"))
+                            .clicked()
+                        {
                             self.request_stage(self.stage.saturating_sub(1));
                         }
                     });
-                    if self.scanning && ui.button("取消扫描").clicked() {
+                    if self.scanning
+                        && ui
+                            .button(crate::i18n::text("Cancel Scan", "取消扫描"))
+                            .clicked()
+                    {
                         if let Some(control) = &self.cancel_scan {
                             control.cancel();
-                            self.status = "正在取消扫描…".into();
+                            self.status =
+                                crate::i18n::text("Canceling scan…", "正在取消扫描…").into();
                         }
                     }
-                    if self.work_running && ui.button("取消当前任务").clicked() {
+                    if self.work_running
+                        && ui
+                            .button(crate::i18n::text("Cancel Current Task", "取消当前任务"))
+                            .clicked()
+                    {
                         if let Some(control) = &self.work_control {
                             control.cancel();
                         }
@@ -3475,9 +4091,9 @@ impl PhotoArchiveApp {
                             .as_ref()
                             .is_some_and(TaskControl::is_paused)
                         {
-                            "扫描暂停中"
+                            crate::i18n::text("Scan paused", "扫描暂停中")
                         } else {
-                            "正在枚举文件"
+                            crate::i18n::text("Enumerating files", "正在枚举文件")
                         },
                     ),
             );
@@ -3497,7 +4113,7 @@ impl PhotoArchiveApp {
         self.final_manifest = None;
         self.scan_progress = ScanProgress::default();
         self.last_scan = None;
-        self.status = "正在读取目录清单…".into();
+        self.status = crate::i18n::text("Reading directory manifest…", "正在读取目录清单…").into();
         thread::spawn(move || {
             let summary = scan_sources(&roots, &worker_control, |progress| {
                 let _ = sender.send(ScanMessage::Progress(progress));
@@ -3548,14 +4164,16 @@ impl PhotoArchiveApp {
                 });
                 self.excluded_final_paths = saved.excluded_paths;
                 self.review_checkpoint_saved = true;
-                self.status = format!(
+                self.status = crate::tr_format!(
+                    "Restored stage ⑥ manual review from a private local checkpoint: {count} confirmed files, {excluded} exclusion decisions. SHA-256 is reread and verified before backup or archiving.",
                     "已从本机私有检查点恢复阶段⑥人工审核：{count} 个已确认文件、{excluded} 个排除决定。备份或归档前仍会重新读取并核对 SHA-256。"
                 );
             }
             Ok(None) => self.review_checkpoint_saved = false,
             Err(error) => {
                 self.review_checkpoint_saved = false;
-                self.status = format!(
+                self.status = crate::tr_format!(
+                    "Could not restore the previous stage ⑥ checkpoint: {error}. Run duplicate review again; existing files were not modified.",
                     "无法恢复上次阶段⑥检查点：{error}。请重新执行重复检查；现有文件未被修改。"
                 );
             }
@@ -3573,18 +4191,24 @@ impl PhotoArchiveApp {
                     let count = items.len();
                     self.pending_copy_resume = Some(items);
                     self.stage = 2;
-                    self.status = format!(
+                    self.status = crate::tr_format!(
+                        "Found an unfinished routing copy task ({count} items). Choose Resume or Discard in stage ③; recovery rechecks existing destinations.",
                         "发现上次未完成的分类复制任务（{count} 项）。请在阶段③选择恢复或丢弃；恢复会重新核对已有目标。"
                     );
                 }
                 Err(error) => {
-                    self.status =
-                        format!("无法读取上次分类复制任务：{error}。记录仍保留供检查或丢弃。");
+                    self.status = crate::tr_format!(
+                        "Could not read the previous routing copy task: {error}. The record remains available for review or discard.",
+                        "无法读取上次分类复制任务：{error}。记录仍保留供检查或丢弃。"
+                    );
                 }
             },
             Ok(None) => self.pending_copy_resume = None,
             Err(error) => {
-                self.status = format!("无法读取上次分类复制检查点：{error}。现有文件未被修改。");
+                self.status = crate::tr_format!(
+                    "Could not read the previous routing copy checkpoint: {error}. Existing files were not modified.",
+                    "无法读取上次分类复制检查点：{error}。现有文件未被修改。"
+                );
             }
         }
     }
@@ -3601,15 +4225,18 @@ impl PhotoArchiveApp {
                 if self.pending_copy_resume.is_none() {
                     self.stage = 6;
                     self.status =
-                        "发现上次未完成的备份任务。阶段⑦可选择重新扫描并恢复；已有目标会重新校验。"
+                        crate::i18n::text("Found an unfinished backup task. In stage ⑦, choose Rescan and Resume; existing destinations will be verified.", "发现上次未完成的备份任务。阶段⑦可选择重新扫描并恢复；已有目标会重新校验。")
                             .into();
                 } else {
-                    self.status = "发现未完成的分类复制和备份任务；可从阶段③或⑦分别恢复。".into();
+                    self.status = crate::i18n::text("Unfinished routing copy and backup tasks found. Resume them separately in stages ③ and ⑦.", "发现未完成的分类复制和备份任务；可从阶段③或⑦分别恢复。").into();
                 }
             }
             Ok(None) => self.pending_backup_resume = None,
             Err(error) => {
-                self.status = format!("无法读取上次备份检查点：{error}。现有文件未被修改。");
+                self.status = crate::tr_format!(
+                    "Could not read the previous backup checkpoint: {error}. Existing files were not modified.",
+                    "无法读取上次备份检查点：{error}。现有文件未被修改。"
+                );
             }
         }
     }
@@ -3628,27 +4255,36 @@ impl PhotoArchiveApp {
                     if self.pending_copy_resume.is_none() && self.pending_backup_resume.is_none() {
                         self.stage = 7;
                         self.status =
-                            "发现上次未完成的加密归档。阶段⑧可重新扫描来源并从头重建；请重新输入密码。"
+                            crate::i18n::text("Found an unfinished encrypted archive. In stage ⑧, rescan the source and rebuild it from the beginning; enter the password again.", "发现上次未完成的加密归档。阶段⑧可重新扫描来源并从头重建；请重新输入密码。")
                                 .into();
                     } else {
                         self.status =
-                            "另有未完成的加密归档恢复记录；阶段⑧可重新扫描并从头重建，密码需重新输入。"
+                            crate::i18n::text("Another unfinished archive recovery record was found. In stage ⑧, rescan and rebuild it from the beginning; enter the password again.", "另有未完成的加密归档恢复记录；阶段⑧可重新扫描并从头重建，密码需重新输入。")
                                 .into();
                     }
                 } else {
                     self.pending_archive_resume = None;
                     let cleanup_warning = checkpoint::clear_pending_archive()
                         .err()
-                        .map(|error| format!("无法清除旧检查点：{error}。"))
+                        .map(|error| {
+                            crate::tr_format!(
+                                "Could not clear the old checkpoint: {error}.",
+                                "无法清除旧检查点：{error}。"
+                            )
+                        })
                         .unwrap_or_default();
-                    self.status = format!(
+                    self.status = crate::tr_format!(
+                        "Archive inputs were restored, but the stage ⑥ review scope differs from or is unavailable compared with the interrupted task. The old recovery record was discarded. Review the current manifest and start again. {cleanup_warning}",
                         "已恢复归档输入，但阶段⑥审核范围与中断前不同或不可用；旧恢复记录已作废。请核对当前审核清单后重新开始。{cleanup_warning}"
                     );
                 }
             }
             Ok(None) => self.pending_archive_resume = None,
             Err(error) => {
-                self.status = format!("无法读取上次加密归档检查点：{error}。现有文件未被修改。");
+                self.status = crate::tr_format!(
+                    "Could not read the previous encrypted archive checkpoint: {error}. Existing files were not modified.",
+                    "无法读取上次加密归档检查点：{error}。现有文件未被修改。"
+                );
             }
         }
     }
@@ -3676,10 +4312,10 @@ impl PhotoArchiveApp {
         self.pending_archive_resume = None;
         match checkpoint::clear_pending_archive() {
             Ok(()) => {
-                self.status = "已丢弃加密归档恢复记录；可能存在的临时文件和已有归档未删除。".into()
+                self.status = crate::i18n::text("Discarded the encrypted archive recovery record. Any temporary files and existing archives were left in place.", "已丢弃加密归档恢复记录；可能存在的临时文件和已有归档未删除。").into()
             }
             Err(error) => {
-                self.status = format!("无法删除加密归档检查点：{error}；现有文件未修改。")
+                self.status = crate::tr_format!("Could not delete the encrypted archive checkpoint: {error}; existing files were not modified.", "无法删除加密归档检查点：{error}；现有文件未修改。")
             }
         }
     }
@@ -3688,7 +4324,8 @@ impl PhotoArchiveApp {
         if self.pending_archive_resume.take().is_some()
             && let Err(error) = checkpoint::clear_pending_archive()
         {
-            self.status = format!(
+            self.status = crate::tr_format!(
+                "Archive inputs changed, but the old recovery checkpoint could not be cleared: {error}. Restart will try to replace the checkpoint.",
                 "归档输入已更改，但无法清除旧恢复检查点：{error}。重新开始时会尝试覆盖检查点。"
             );
         }
@@ -3705,9 +4342,9 @@ impl PhotoArchiveApp {
     fn discard_pending_backup(&mut self) {
         self.pending_backup_resume = None;
         match checkpoint::clear_pending_backup() {
-            Ok(()) => self.status = "已丢弃备份恢复记录；现有目标文件未删除。".into(),
+            Ok(()) => self.status = crate::i18n::text("Discarded the backup recovery record; existing destination files were not deleted.", "已丢弃备份恢复记录；现有目标文件未删除。").into(),
             Err(error) => {
-                self.status = format!("无法删除备份恢复检查点：{error}；现有文件未修改。")
+                self.status = crate::tr_format!("Could not delete the backup recovery checkpoint: {error}; existing files were not modified.", "无法删除备份恢复检查点：{error}；现有文件未修改。")
             }
         }
     }
@@ -3723,9 +4360,9 @@ impl PhotoArchiveApp {
     fn discard_pending_copy(&mut self) {
         self.pending_copy_resume = None;
         match checkpoint::clear_pending_copy() {
-            Ok(()) => self.status = "已丢弃未完成复制的恢复记录；现有目标文件未删除。".into(),
+            Ok(()) => self.status = crate::i18n::text("Discarded the unfinished copy recovery record; existing destination files were not deleted.", "已丢弃未完成复制的恢复记录；现有目标文件未删除。").into(),
             Err(error) => {
-                self.status = format!("无法删除未完成复制检查点：{error}；现有目标文件未修改。")
+                self.status = crate::tr_format!("Could not delete the unfinished copy checkpoint: {error}; existing files were not modified.", "无法删除未完成复制检查点：{error}；现有目标文件未修改。")
             }
         }
     }
@@ -3746,7 +4383,8 @@ impl PhotoArchiveApp {
             Ok(()) => self.review_checkpoint_saved = true,
             Err(error) => {
                 self.review_checkpoint_saved = false;
-                self.status = format!(
+                self.status = crate::tr_format!(
+                    "Stage ⑥ review decisions were carried through this run but could not be saved to a private local recovery checkpoint: {error}. Review them again after closing the app.",
                     "阶段⑥审核在本次运行中已携带，但无法写入本机私有恢复检查点：{error}。应用退出后需要重新审核。"
                 );
             }
@@ -3760,14 +4398,23 @@ impl PhotoArchiveApp {
         self.clear_backup_results();
         self.pending_backup_resume = None;
         if let Err(error) = checkpoint::clear_pending_backup() {
-            self.status = format!("无法清除过期备份检查点：{error}");
+            self.status = crate::tr_format!(
+                "Could not clear the expired backup checkpoint: {error}",
+                "无法清除过期备份检查点：{error}"
+            );
         }
         self.pending_archive_resume = None;
         if let Err(error) = checkpoint::clear_pending_archive() {
-            self.status = format!("无法清除过期归档检查点：{error}");
+            self.status = crate::tr_format!(
+                "Could not clear the expired archive checkpoint: {error}",
+                "无法清除过期归档检查点：{error}"
+            );
         }
         if let Err(error) = checkpoint::clear() {
-            self.status = format!("无法清除本机阶段⑥恢复检查点：{error}");
+            self.status = crate::tr_format!(
+                "Could not clear the local stage ⑥ recovery checkpoint: {error}",
+                "无法清除本机阶段⑥恢复检查点：{error}"
+            );
         }
     }
 
@@ -3785,7 +4432,7 @@ impl PhotoArchiveApp {
         ));
         self.persist_saved_review();
         if self.review_checkpoint_saved {
-            self.status = "阶段⑥最终清单已更新；此前备份校验结果已清除。".into();
+            self.status = crate::i18n::text("Stage ⑥ final manifest updated; previous backup verification results were cleared.", "阶段⑥最终清单已更新；此前备份校验结果已清除。").into();
         }
     }
 
@@ -3812,7 +4459,11 @@ impl PhotoArchiveApp {
         self.verify_results.clear();
         self.verify_coverage = None;
         self.verify_needs_recheck = false;
-        self.status = "校验路径已更改；旧校验结果已清除。".into();
+        self.status = crate::i18n::text(
+            "Verification paths changed; previous verification results were cleared.",
+            "校验路径已更改；旧校验结果已清除。",
+        )
+        .into();
     }
 
     fn finish_routing_stage(&mut self) {
@@ -3846,13 +4497,14 @@ impl PhotoArchiveApp {
                 .collect::<Vec<_>>()
                 .join("；");
         let mappings = if mappings.is_empty() {
-            "无".to_string()
+            crate::i18n::text("None", "无").to_string()
         } else {
             mappings
         };
         let routed_count = self.copy_plan().items.len();
-        self.handoff_title = "文件分类已完成".into();
-        self.handoff_description = format!(
+        self.handoff_title = crate::i18n::text("File routing completed", "文件分类已完成").into();
+        self.handoff_description = crate::tr_format!(
+            "Destinations are set for {} of {} scanned extensions; {} files are routable. Mapping: {}. {} The next stage previews filtered files, path overlaps, and destination conflicts. No files were copied in this stage.",
             "已为 {} 种扩展名中的 {} 种配置目标，当前可路由 {} 个文件。映射：{}。{}下一阶段会预览过滤项、路径重叠和目标冲突；本阶段没有复制文件。",
             required_extensions.len(),
             required_extensions.len().saturating_sub(unmapped.len()),
@@ -3861,7 +4513,8 @@ impl PhotoArchiveApp {
             if unmapped.is_empty() {
                 String::new()
             } else {
-                format!(
+                crate::tr_format!(
+                    "Unmapped extensions: {}; related files remain in the manifest and will be skipped during copying.",
                     "未映射扩展名：{}；相关文件会保留在清单并跳过复制。",
                     unmapped.join("、")
                 )
@@ -3888,10 +4541,17 @@ impl PhotoArchiveApp {
         self.copy_planned = 0;
         self.pending_copy_resume = None;
         if let Err(error) = checkpoint::clear_pending_copy() {
-            self.status = format!("无法清除过期复制检查点：{error}");
+            self.status = crate::tr_format!(
+                "Could not clear the expired copy checkpoint: {error}",
+                "无法清除过期复制检查点：{error}"
+            );
         }
         self.invalidate_after_copy_change();
-        self.status = "来源、路由或过滤设置已更改；依赖的旧结果已清除。".into();
+        self.status = crate::i18n::text(
+            "Sources, routing, or filters changed; dependent results were cleared.",
+            "来源、路由或过滤设置已更改；依赖的旧结果已清除。",
+        )
+        .into();
     }
 
     fn receive_scan_updates(&mut self) {
@@ -3908,13 +4568,18 @@ impl PhotoArchiveApp {
                         directories: self.scan_progress.directories,
                     };
                     self.scanning = false;
-                    self.status = format!("扫描完成：{} 个文件。", summary.files.len());
+                    self.status = crate::tr_format!(
+                        "Scan completed: {} files.",
+                        "扫描完成：{} 个文件。",
+                        summary.files.len()
+                    );
                     self.last_scan = Some(summary);
                     self.sync_routes();
                     self.scan_receiver = None;
                     self.cancel_scan = None;
-                    self.handoff_title = "来源扫描已完成".into();
-                    self.handoff_description = "下一阶段可接收来源路径、文件清单、大小、修改时间和扩展名。数据只在本次运行内存中传递。".into();
+                    self.handoff_title =
+                        crate::i18n::text("Source scan completed", "来源扫描已完成").into();
+                    self.handoff_description = crate::i18n::text("The next stage can receive source paths, a file manifest, sizes, modification times, and extensions. Data is passed in memory for this run only.", "下一阶段可接收来源路径、文件清单、大小、修改时间和扩展名。数据只在本次运行内存中传递。").into();
                     self.show_handoff = !self.apply_pending_stage();
                     break;
                 }
@@ -3923,7 +4588,11 @@ impl PhotoArchiveApp {
                     self.scanning = false;
                     self.scan_receiver = None;
                     self.cancel_scan = None;
-                    self.status = "扫描已取消；本次未保存不完整清单。".into();
+                    self.status = crate::i18n::text(
+                        "Scan canceled; the incomplete manifest was not saved.",
+                        "扫描已取消；本次未保存不完整清单。",
+                    )
+                    .into();
                     self.apply_pending_stage();
                     break;
                 }
@@ -3932,7 +4601,11 @@ impl PhotoArchiveApp {
                     self.scanning = false;
                     self.scan_receiver = None;
                     self.cancel_scan = None;
-                    self.status = "扫描线程意外结束；请重新扫描。".into();
+                    self.status = crate::i18n::text(
+                        "Scan thread ended unexpectedly. Scan again.",
+                        "扫描线程意外结束；请重新扫描。",
+                    )
+                    .into();
                     break;
                 }
             }
@@ -3941,23 +4614,38 @@ impl PhotoArchiveApp {
 
     fn handoff_dialog(&mut self, ctx: &eframe::egui::Context) {
         let mut action = None;
-        let last_stage = self.stage + 1 == STAGES.len();
-        eframe::egui::Window::new(&self.handoff_title)
+        let last_stage = self.stage + 1 == 8;
+        eframe::egui::Window::new(i18n::localize_dynamic(self.language, &self.handoff_title))
             .collapsible(false)
             .resizable(false)
             .anchor(eframe::egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(&self.handoff_description);
+                ui.label(i18n::localize_dynamic(
+                    self.language,
+                    &self.handoff_description,
+                ));
                 ui.add_space(8.0);
                 let carry_label = if last_stage {
-                    "保留归档结果并返回阶段①"
+                    crate::i18n::text(
+                        "Keep Archive Results and Return to Stage ①",
+                        "保留归档结果并返回阶段①",
+                    )
                 } else {
-                    "携带本阶段信息并进入下一阶段"
+                    crate::i18n::text(
+                        "Carry This Stage’s Information to the Next Stage",
+                        "携带本阶段信息并进入下一阶段",
+                    )
                 };
                 let discard_label = if last_stage {
-                    "不携带本次结果并返回阶段①"
+                    crate::i18n::text(
+                        "Return to Stage ① Without Carrying These Results",
+                        "不携带本次结果并返回阶段①",
+                    )
                 } else {
-                    "不携带信息并进入下一阶段"
+                    crate::i18n::text(
+                        "Continue Without Carrying Information",
+                        "不携带信息并进入下一阶段",
+                    )
                 };
                 let carry_button = eframe::egui::Button::new(
                     eframe::egui::RichText::new(carry_label).color(eframe::egui::Color32::WHITE),
@@ -3969,10 +4657,16 @@ impl PhotoArchiveApp {
                 if ui.button(discard_label).clicked() {
                     action = Some(1);
                 }
-                if ui.button("停留在本阶段").clicked() {
+                if ui
+                    .button(crate::i18n::text("Stay in This Stage", "停留在本阶段"))
+                    .clicked()
+                {
                     action = Some(2);
                 }
-                if ui.button("退出流程").clicked() {
+                if ui
+                    .button(crate::i18n::text("Exit Workflow", "退出流程"))
+                    .clicked()
+                {
                     self.show_handoff = false;
                     ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
                 }
@@ -3985,7 +4679,7 @@ impl PhotoArchiveApp {
                 }
                 if last_stage {
                     self.status =
-                        "归档结果已保留；流程返回阶段①，可重新扫描或在阶段⑧查看归档结果。".into();
+                        crate::i18n::text("Archive results were kept. The workflow returned to stage ①; rescan or review the archive results in stage ⑧.", "归档结果已保留；流程返回阶段①，可重新扫描或在阶段⑧查看归档结果。").into();
                     self.stage = 0;
                 } else {
                     self.stage += 1;
@@ -4021,10 +4715,10 @@ impl PhotoArchiveApp {
                     self.archive_confirmation.zeroize();
                     self.archive_show_password = false;
                     self.status =
-                        "本次归档结果未携带；已生成的归档文件保留在磁盘上。流程返回阶段①。".into();
+                        crate::i18n::text("Archive results were not carried forward. Any archive already created remains on disk. The workflow returned to stage ①.", "本次归档结果未携带；已生成的归档文件保留在磁盘上。流程返回阶段①。").into();
                     self.stage = 0;
                 } else {
-                    self.status = "未携带来源清单；下一阶段需重新选择输入。".into();
+                    self.status = crate::i18n::text("No source manifest was carried forward. Select the input again in the next stage.", "未携带来源清单；下一阶段需重新选择输入。").into();
                     self.stage += 1;
                 }
             }
@@ -4035,36 +4729,45 @@ impl PhotoArchiveApp {
 
     fn license_dialog(&mut self, ctx: &eframe::egui::Context) {
         let mut open = self.show_licenses;
-        eframe::egui::Window::new("开源许可与第三方声明")
-            .open(&mut open)
-            .default_size([760.0, 580.0])
-            .resizable(true)
-            .show(ctx, |ui| {
-                let choices = [
-                    "第三方声明",
-                    "ExifTool · Artistic License 1.0",
+        eframe::egui::Window::new(crate::i18n::text(
+            "Open-Source Licenses and Third-Party Notices",
+            "开源许可与第三方声明",
+        ))
+        .open(&mut open)
+        .default_size([760.0, 580.0])
+        .resizable(true)
+        .show(ctx, |ui| {
+            let choices = [
+                crate::i18n::text("Third-Party Notices", "第三方声明"),
+                "ExifTool · Artistic License 1.0",
+                crate::i18n::text(
+                    "Windows ExifTool / Perl License Texts",
                     "Windows ExifTool / Perl 许可文本",
+                ),
+                crate::i18n::text(
+                    "Complete Rust Dependency License List",
                     "Rust 依赖完整许可清单",
-                ];
-                eframe::egui::ComboBox::from_label("查看文本")
-                    .selected_text(choices[self.license_choice.min(choices.len() - 1)])
-                    .show_ui(ui, |ui| {
-                        for (index, label) in choices.iter().enumerate() {
-                            ui.selectable_value(&mut self.license_choice, index, *label);
-                        }
-                    });
-                let text = match self.license_choice {
-                    1 => EXIFTOOL_LICENSE,
-                    2 => EXIFTOOL_WINDOWS_LICENSES,
-                    3 => RUST_DEPENDENCY_LICENSES,
-                    _ => LICENSE_NOTICES,
-                };
-                eframe::egui::ScrollArea::vertical()
-                    .max_height(500.0)
-                    .show(ui, |ui| {
-                        ui.add(eframe::egui::Label::new(text).wrap().selectable(true));
-                    });
-            });
+                ),
+            ];
+            eframe::egui::ComboBox::from_label(crate::i18n::text("View Text", "查看文本"))
+                .selected_text(choices[self.license_choice.min(choices.len() - 1)])
+                .show_ui(ui, |ui| {
+                    for (index, label) in choices.iter().enumerate() {
+                        ui.selectable_value(&mut self.license_choice, index, *label);
+                    }
+                });
+            let text = match self.license_choice {
+                1 => EXIFTOOL_LICENSE,
+                2 => EXIFTOOL_WINDOWS_LICENSES,
+                3 => RUST_DEPENDENCY_LICENSES,
+                _ => LICENSE_NOTICES,
+            };
+            eframe::egui::ScrollArea::vertical()
+                .max_height(500.0)
+                .show(ui, |ui| {
+                    ui.add(eframe::egui::Label::new(text).wrap().selectable(true));
+                });
+        });
         self.show_licenses = open;
     }
 
@@ -4100,30 +4803,30 @@ impl PhotoArchiveApp {
 
     fn stage_switch_dialog(&mut self, ctx: &eframe::egui::Context) {
         let mut action = None;
-        eframe::egui::Window::new("当前阶段仍在处理")
+        eframe::egui::Window::new(crate::i18n::text("Current Stage Is Still Processing", "当前阶段仍在处理"))
             .collapsible(false)
             .resizable(false)
             .anchor(eframe::egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 if self.pending_pause_switch {
                     ui.label(
-                        "正在等待当前文件或扫描条目到达安全边界；到达后任务会暂停并切换阶段。",
+                        crate::i18n::text("Waiting for the current file or scan entry to reach a safe boundary. The task will pause and switch stages when it does.", "正在等待当前文件或扫描条目到达安全边界；到达后任务会暂停并切换阶段。"),
                     );
-                    if ui.button("取消切换，继续当前任务").clicked() {
+                    if ui.button(crate::i18n::text("Cancel Switch and Continue Current Task", "取消切换，继续当前任务")).clicked() {
                         action = Some(0);
                     }
                 } else {
                     ui.label(
-                        "当前处理会在安全边界暂停或停止（扫描条目之间，或当前文件处理完成后）。",
+                        crate::i18n::text("Current processing will pause or stop at a safe boundary (between scan entries or after the current file completes).", "当前处理会在安全边界暂停或停止（扫描条目之间，或当前文件处理完成后）。"),
                     );
                     ui.add_space(8.0);
-                    if ui.button("继续当前处理").clicked() {
+                    if ui.button(crate::i18n::text("Continue Current Processing", "继续当前处理")).clicked() {
                         action = Some(1);
                     }
-                    if ui.button("暂停后切换阶段").clicked() {
+                    if ui.button(crate::i18n::text("Pause, Then Switch Stages", "暂停后切换阶段")).clicked() {
                         action = Some(2);
                     }
-                    if ui.button("取消当前处理并切换阶段").clicked() {
+                    if ui.button(crate::i18n::text("Cancel Current Processing and Switch Stages", "取消当前处理并切换阶段")).clicked() {
                         action = Some(3);
                     }
                 }
@@ -4148,7 +4851,7 @@ impl PhotoArchiveApp {
                 if let Some(control) = self.cancel_scan.as_ref().or(self.work_control.as_ref()) {
                     control.set_paused(true);
                     self.pending_pause_switch = true;
-                    self.status = "正在等待安全边界；到达后任务会暂停并切换阶段。".into();
+                    self.status = crate::i18n::text("Waiting for a safe boundary; the task will pause and switch stages when it reaches one.", "正在等待安全边界；到达后任务会暂停并切换阶段。").into();
                 } else {
                     self.apply_pending_stage();
                 }
@@ -4161,7 +4864,11 @@ impl PhotoArchiveApp {
                 if let Some(control) = &self.work_control {
                     control.cancel();
                 }
-                self.status = "已请求安全停止；当前文件完成后切换阶段。".into();
+                self.status = crate::i18n::text(
+                    "Safe stop requested; switch stages after the current file completes.",
+                    "已请求安全停止；当前文件完成后切换阶段。",
+                )
+                .into();
             }
             _ => {}
         }
@@ -4175,10 +4882,20 @@ impl PhotoArchiveApp {
             .is_some_and(TaskControl::is_paused_at_boundary);
         if self.pending_pause_switch && paused_at_boundary {
             let destination = self.pending_stage.map_or_else(
-                || "目标阶段".into(),
-                |stage| format!("阶段{}：{}", stage + 1, STAGES[stage]),
+                || crate::i18n::text("Destination Stage", "目标阶段").into(),
+                |stage| {
+                    crate::tr_format!(
+                        "Stage {}: {}",
+                        "阶段{}：{}",
+                        stage + 1,
+                        stage_names()[stage]
+                    )
+                },
             );
-            self.status = format!("任务已在安全边界暂停；可从底部恢复。已切换到{destination}。");
+            self.status = crate::tr_format!(
+                "Task paused at a safe boundary. Resume it from the bottom. Switched to {destination}.",
+                "任务已在安全边界暂停；可从底部恢复。已切换到{destination}。"
+            );
             self.apply_pending_stage();
         }
     }
@@ -4192,10 +4909,19 @@ impl Drop for PhotoArchiveApp {
 }
 
 fn insert_source_root(roots: &mut Vec<SourceRoot>, path: PathBuf) -> Result<bool, String> {
-    let canonical = fs::canonicalize(&path)
-        .map_err(|error| format!("无法解析目录路径 {}：{error}", path.display()))?;
+    let canonical = fs::canonicalize(&path).map_err(|error| {
+        crate::tr_format!(
+            "Could not resolve folder path {}: {error}",
+            "无法解析目录路径 {}：{error}",
+            path.display()
+        )
+    })?;
     if !canonical.is_dir() {
-        return Err(format!("所选路径不是目录：{}", canonical.display()));
+        return Err(crate::tr_format!(
+            "Selected path is not a folder: {}",
+            "所选路径不是目录：{}",
+            canonical.display()
+        ));
     }
     if roots.iter().any(|root| canonical.starts_with(&root.path)) {
         return Ok(false);
@@ -4219,21 +4945,43 @@ fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
 
     for mapping in mappings {
         let Some(source) = &mapping.source else {
-            errors.insert("有一行尚未选择本地来源文件夹".to_string());
+            errors.insert(
+                crate::i18n::text(
+                    "One row has no source folder selected",
+                    "有一行尚未选择本地来源文件夹",
+                )
+                .to_string(),
+            );
             continue;
         };
         if !source.is_dir() {
-            errors.insert(format!("来源目录不存在或不可访问：{}", source.display()));
+            errors.insert(crate::tr_format!(
+                "Source folder does not exist or cannot be accessed: {}",
+                "来源目录不存在或不可访问：{}",
+                source.display()
+            ));
         }
         if mapping.targets.is_empty() {
-            errors.insert(format!("{} 尚无备份目标", source.display()));
+            errors.insert(crate::tr_format!(
+                "{} has no backup destinations",
+                "{} 尚无备份目标",
+                source.display()
+            ));
         }
         for target in &mapping.targets {
             if !target.is_dir() {
-                errors.insert(format!("备份目标不存在或不可访问：{}", target.display()));
+                errors.insert(crate::tr_format!(
+                    "Backup destination does not exist or cannot be accessed: {}",
+                    "备份目标不存在或不可访问：{}",
+                    target.display()
+                ));
             }
             if source == target {
-                errors.insert(format!("{} 与目标相同，没有独立备份副本", source.display()));
+                errors.insert(crate::tr_format!(
+                    "{} is the same as the destination; no separate backup copy will be made",
+                    "{} 与目标相同，没有独立备份副本",
+                    source.display()
+                ));
             }
         }
     }
@@ -4241,7 +4989,8 @@ fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
     for (index, first) in sources.iter().enumerate() {
         for second in sources.iter().skip(index + 1) {
             if first.starts_with(second) || second.starts_with(first) {
-                errors.insert(format!(
+                errors.insert(crate::tr_format!(
+                    "Source folders overlap and would include files more than once: {} and {}",
                     "来源目录互相包含，会重复纳入文件：{} 与 {}",
                     first.display(),
                     second.display()
@@ -4250,8 +4999,8 @@ fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
         }
         for target in &targets {
             if first.starts_with(target) || target.starts_with(first) {
-                errors.insert(format!(
-                    "来源与备份目标互相重叠：{} 与 {}；为避免递归或把备份当来源，请选择不重叠的目录",
+                errors.insert(crate::tr_format!(
+                    "Source and backup destination overlap: {} and {}. Choose non-overlapping folders to prevent recursion or including the backup as a source.", "来源与备份目标互相重叠：{} 与 {}；为避免递归或把备份当来源，请选择不重叠的目录",
                     first.display(),
                     target.display()
                 ));
@@ -4262,8 +5011,8 @@ fn backup_mapping_errors(mappings: &[BackupMapping]) -> Vec<String> {
     for (index, first) in targets.iter().enumerate() {
         for second in targets.iter().skip(index + 1) {
             if first != second && (first.starts_with(second) || second.starts_with(first)) {
-                errors.insert(format!(
-                    "备份目标互相包含：{} 与 {}；请选择互不嵌套的目标目录",
+                errors.insert(crate::tr_format!(
+                    "Backup destinations overlap: {} and {}. Choose destination folders that are not nested.", "备份目标互相包含：{} 与 {}；请选择互不嵌套的目标目录",
                     first.display(),
                     second.display()
                 ));
@@ -4284,7 +5033,13 @@ fn append_task_error(error: &mut Option<String>, message: impl Into<String>) {
 fn backup_error_requires_retry(error: Option<&str>) -> bool {
     error.is_some_and(|error| {
         error.split('；').any(|part| {
-            !part.starts_with("按阶段⑥决定排除了") && !part.starts_with("最终清单之外的")
+            !part.starts_with(crate::i18n::text(
+                "Excluded based on stage ⑥ decisions",
+                "按阶段⑥决定排除了",
+            )) && !part.starts_with(crate::i18n::text(
+                "outside the final manifest",
+                "最终清单之外的",
+            ))
         })
     })
 }
@@ -4302,7 +5057,8 @@ fn inspect_backup_targets(
         match scan_sources(std::slice::from_ref(target), control, |_| {}) {
             Ok(summary) => {
                 if summary.error_count > 0 {
-                    warnings.push(format!(
+                    warnings.push(crate::tr_format!(
+                        "Scanning backup destination {}: {} read errors",
                         "扫描备份目标 {} 时有 {} 项读取错误",
                         target.display(),
                         summary.error_count
@@ -4310,14 +5066,15 @@ fn inspect_backup_targets(
                     results.push(VerifyItemResult {
                         source: source.clone(),
                         destination: target.clone(),
-                        result: Err(format!(
+                        result: Err(crate::tr_format!(
+                            "Target directory scan had {} read errors; example: {}",
                             "目标目录扫描有 {} 项读取错误；示例：{}",
                             summary.error_count,
                             summary
                                 .error_samples
                                 .first()
                                 .map(String::as_str)
-                                .unwrap_or("未提供")
+                                .unwrap_or(crate::i18n::text("Not provided", "未提供"))
                         )),
                     });
                 }
@@ -4326,18 +5083,22 @@ fn inspect_backup_targets(
                         results.push(VerifyItemResult {
                             source: source.clone(),
                             destination: file.path,
-                            result: Err("目标包含不在本次来源清单中的额外文件。".into()),
+                            result: Err(crate::i18n::text("Target contains extra files that are not in this session’s source manifest.", "目标包含不在本次来源清单中的额外文件。").into()),
                         });
                     }
                 }
             }
             Err(_) if control.is_cancelled() => break,
             Err(_) => {
-                warnings.push(format!("无法完成目标扫描：{}", target.display()));
+                warnings.push(crate::tr_format!(
+                    "Could not complete target scan: {}",
+                    "无法完成目标扫描：{}",
+                    target.display()
+                ));
                 results.push(VerifyItemResult {
                     source: source.clone(),
                     destination: target.clone(),
-                    result: Err("目标扫描未完成；请检查磁盘连接和目录权限。".into()),
+                    result: Err(crate::i18n::text("Target scan did not complete. Check the drive connection and folder permissions.", "目标扫描未完成；请检查磁盘连接和目录权限。").into()),
                 });
             }
         }
@@ -4398,7 +5159,9 @@ fn scan_sources(
                         .and_then(|extension| extension.to_str())
                         .filter(|extension| !extension.is_empty())
                         .map(str::to_ascii_uppercase)
-                        .unwrap_or_else(|| "(无扩展名)".into());
+                        .unwrap_or_else(|| {
+                            crate::i18n::text("(no extension)", "(无扩展名)").into()
+                        });
                     let relative_path = path
                         .strip_prefix(root)
                         .map(Path::to_path_buf)
@@ -4569,17 +5332,34 @@ fn decode_candidate_preview(path: &Path) -> Result<PreviewPixels, String> {
 
     image_formats::register_heif_decoder();
     let reader = image::ImageReader::open(path)
-        .map_err(|error| format!("无法打开预览文件：{error}"))?
+        .map_err(|error| {
+            crate::tr_format!(
+                "Could not open preview file: {error}",
+                "无法打开预览文件：{error}"
+            )
+        })?
         .with_guessed_format()
-        .map_err(|error| format!("无法识别图片格式：{error}"))?;
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|error| format!("当前预览仅支持 JPEG/PNG：{error}"))?;
-    let orientation = decoder
-        .orientation()
-        .map_err(|error| format!("无法读取图片方向：{error}"))?;
-    let mut decoded = image::DynamicImage::from_decoder(decoder)
-        .map_err(|error| format!("图片解码失败：{error}"))?;
+        .map_err(|error| {
+            crate::tr_format!(
+                "Could not identify image format: {error}",
+                "无法识别图片格式：{error}"
+            )
+        })?;
+    let mut decoder = reader.into_decoder().map_err(|error| {
+        crate::tr_format!(
+            "Preview supports JPEG and PNG only: {error}",
+            "当前预览仅支持 JPEG/PNG：{error}"
+        )
+    })?;
+    let orientation = decoder.orientation().map_err(|error| {
+        crate::tr_format!(
+            "Could not read image orientation: {error}",
+            "无法读取图片方向：{error}"
+        )
+    })?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder).map_err(|error| {
+        crate::tr_format!("Image decode failed: {error}", "图片解码失败：{error}")
+    })?;
     decoded.apply_orientation(orientation);
     Ok(PreviewPixels {
         image: decoded.thumbnail(640, 640).to_rgba8(),
@@ -4615,7 +5395,10 @@ fn show_candidate_preview(
                 ui.image((texture.id(), size * scale));
             }
             Err(error) => {
-                ui.colored_label(eframe::egui::Color32::from_rgb(160, 90, 0), error);
+                ui.colored_label(
+                    eframe::egui::Color32::from_rgb(160, 90, 0),
+                    i18n::localize_dynamic(i18n::current_language(), error),
+                );
             }
         }
     });
@@ -4660,7 +5443,10 @@ fn restored_copy_item(item: checkpoint::SavedCopyItem) -> std::io::Result<Routed
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "复制任务修改时间超出系统范围",
+                    crate::i18n::text(
+                        "Copy task modification time is out of range",
+                        "复制任务修改时间超出系统范围",
+                    ),
                 )
             })?;
             Some(time)
@@ -4669,7 +5455,10 @@ fn restored_copy_item(item: checkpoint::SavedCopyItem) -> std::io::Result<Routed
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "复制任务修改时间字段不完整",
+                crate::i18n::text(
+                    "Copy task modification time is incomplete",
+                    "复制任务修改时间字段不完整",
+                ),
             ));
         }
     };
@@ -4713,6 +5502,8 @@ fn main() -> eframe::Result {
                 .egui_ctx
                 .set_visuals(eframe::egui::Visuals::light());
             let mut app = PhotoArchiveApp::default();
+            app.language = i18n::load_preference();
+            i18n::set_current_language(app.language);
             app.restore_saved_review();
             app.restore_pending_copy();
             app.restore_pending_backup();

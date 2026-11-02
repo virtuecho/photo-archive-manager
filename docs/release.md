@@ -1,57 +1,68 @@
-# 本机构建与发布状态
+# Build and release guide
 
-## 当前可复现构建
+**English | [简体中文](release.zh-CN.md)**
 
-macOS arm64 构建脚本要求本机 Rust 工具链，并用锁定的 Cargo 依赖运行格式检查、默认测试及 Release 构建：
+This guide explains how to rebuild the current platform packages and where to find them. Builds are development packages until each platform passes the clean-machine checks below.
+
+## One-command build
+
+Run this command on an Apple Silicon Mac with Rust targets for macOS arm64, macOS Intel, and Windows x86_64 installed, plus MinGW-w64 and Python 3.11 or later:
+
+```sh
+./scripts/build-releases.sh
+```
+
+The script runs the platform build entries in sequence. They check formatting, run the locked Rust test suite, and build optimized binaries. It then assembles the app bundle and ZIP files. The macOS arm64 entry requires an Apple Silicon macOS host; Windows is cross-compiled and must still be checked on Windows.
+
+## Stable output locations
+
+Build binaries are written to these Cargo target paths:
+
+| Platform | Binary path |
+| --- | --- |
+| macOS Apple Silicon | `target/aarch64-apple-darwin/release/photo-archive-manager` |
+| macOS Intel | `target/x86_64-apple-darwin/release/photo-archive-manager` |
+| Windows x86_64 | `target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe` |
+
+All distributable ZIP files and their SHA-256 list are written to the same directory: `target/Releases/`. The ZIP filenames include the app version, platform, and architecture:
+
+```text
+PhotoArchiveManager-0.1.0-macOS-AppleSilicon-arm64.zip
+PhotoArchiveManager-0.1.0-macOS-Intel-x86_64.zip
+PhotoArchiveManager-0.1.0-Windows-x86_64.zip
+SHA256SUMS.txt
+```
+
+The version is read from `Cargo.toml`, so filenames follow the version in the source. Running the packaging step replaces the generated `target/Releases/` directory. ZIP entries are sorted and use fixed timestamps for stable packaging metadata; this does not by itself promise byte-for-byte identical compiled binaries across toolchains.
+
+## What's inside
+
+- Each macOS ZIP contains `Photo Archive Manager.app`, with its executable under `Contents/MacOS/`, an `Info.plist`, and the bilingual user and technical documents under `Contents/Resources/Documentation/`.
+- The Windows ZIP contains the x86_64 GUI executable, the bilingual documents, and the Windows ExifTool/Perl license texts.
+- Each package contains a bilingual `PACKAGE-INFO.txt` with its platform and current acceptance status. The root `SHA256SUMS.txt` lists each ZIP digest.
+
+The `.app` bundle is not signed or notarized. Gatekeeper behavior, clean-system startup, full workflows, and distribution acceptance have not been completed. The Windows executable is cross-compiled on macOS and has not yet completed Windows-machine acceptance. Treat these as development builds.
+
+## Platform build commands
+
+To rebuild one target separately, use:
 
 ```sh
 ./scripts/build-macos-arm64.sh
-```
-
-输出文件为 `target/aarch64-apple-darwin/release/photo-archive-manager`。它是一个 Mach-O 可执行文件，包含本机 macOS arm64 的 ExifTool 有效载荷；归档功能使用进程内 Rust 7z 引擎。运行程序不需要从 `PATH` 安装或查找 ExifTool、7-Zip、Perl 或 Python。
-
-macOS Intel 可在 macOS 主机上安装 Rust x86_64 target 后构建：
-
-```sh
 ./scripts/build-macos-x86_64.sh
-```
-
-已构建 `target/x86_64-apple-darwin/release/photo-archive-manager`，嵌入独立 x86_64 ExifTool/Perl payload；Intel 目标的 ExifTool 释放和启动用例已在 Rosetta 下通过。此构建尚未在 Intel 实机或干净系统完成全流程验收。
-
-Windows x86_64 可在本机安装 Rust GNU target 与 MinGW-w64 后运行：
-
-```sh
 ./scripts/build-windows-x86_64.sh
 ```
 
-输出文件为 `target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe`。本机生成的 PE32+ GUI 程序约 21 MB，嵌入官方 ExifTool 13.60 x64 ZIP；启动元数据检查时会在 `%LOCALAPPDATA%/PhotoArchiveManager/runtime` 下校验并释放 ExifTool、Perl 与 DLL，然后清理。构建脚本检查 GUI 子系统以及 PE 导入表中没有 MinGW runtime DLL。该产物仍需在 Windows 上实机启动与离线全流程验证。
+Run `python3 scripts/package-releases.py` after the target binaries exist to regenerate all platform ZIPs. This command expects all three binaries and the release documents.
 
-## 构建路径检查
+The macOS ExifTool payloads are checked against pinned SHA-256 values. Build flags remap the repository and Cargo cache locations before compiling. Windows checks the bundled upstream ExifTool ZIP and inspects the resulting PE GUI subsystem and runtime DLL imports. The app uses its in-process Rust 7z implementation; ExifTool, Perl, and 7-Zip do not need to be installed on `PATH` for the supported bundled workflows.
 
-三个构建入口都会把仓库目录和 Cargo 缓存目录从 Rust 产物路径中重映射，。macOS ExifTool payload 的当前校验值见 [`resources/exiftool/THIRD_PARTY_NOTICES.md`](../resources/exiftool/THIRD_PARTY_NOTICES.md)；arm64 payload 使用注明的 ExifTool 与 PAR::Packer 源码重新打包，避免在已签名二进制上直接改写路径。
+## Current validation limits
 
-超过默认单卷上限的大文件验收需显式运行，因为它会完整流式处理至少 2 GB：
+- macOS arm64: the native window and file picker have been exercised on the build host. Full offline acceptance on a clean Mac is still outstanding.
+- macOS Intel: the app and ExifTool payload have a Rosetta smoke check, but there is no Intel Mac or clean-machine full-flow acceptance yet.
+- Windows x86_64: the GUI executable and embedded ExifTool package are cross-built and statically checked; Windows runtime and offline acceptance are outstanding.
+- Real-device HEIC/HEIF samples, signing, notarization, Finder launch, and Gatekeeper distribution checks remain open.
+- The archive writer first creates a complete temporary 7z stream and then splits it into volumes. Temporary disk use can approach twice the final archive size; isolated restore verification needs additional space for a restored copy.
 
-```sh
-cargo test --release archive::tests::archives_a_single_file_larger_than_the_default_volume_limit -- --ignored --nocapture
-```
-
-## 发布判定
-
-当前产物仍是开发构建，不是已批准的最终发布包。没有在断网干净系统上完成安装依赖为零的启动和全流程验收，也没有签名/公证；本机 GUI 文件选择器、Dock 和 Gatekeeper 的裸 Mach-O 分发行为尚未确认。Windows 产物只在 macOS 上交叉编译，尚无 Windows 实机运行证据；macOS Intel 交叉构建已完成，但需做 Intel/干净系统全流程验收。
-
-因此，本仓库目前不能宣称达到交接方案要求的 Windows/macOS 单文件、自包含、离线最终交付定义。macOS Intel 已有 ExifTool payload 和交叉构建产物，但需完成整机/干净系统验收；Windows 也需实机验收。请在获得目标平台干净系统验收和分发验证前，把 `target/` 产物视为开发文件。
-
-## 已知限制
-
-- ExifTool 已有 macOS arm64、macOS x86_64 与 Windows x86_64 payload；Intel payload 在 Rosetta 下已做版本启动检查，完整 Intel 应用和干净机器运行仍待验收。Windows 包装路径通过上游哈希、ZIP 解包、释放 EXE 哈希和版本文本检查，但没有 Windows 实机验证。
-- 重复检查支持 JPEG/PNG/HEIC/HEIF pHash 与并排预览；HEIF 使用内置纯 Rust Heifer 解码器，并限制为 5000 万像素。当前只用编码生成的 HEIC 样本验证，需补真实手机样本验收；没有 RAW 解码或可导出的 Final Manifest。携带阶段⑥结果后，Final Manifest 的路径、SHA-256 和排除决定会保存到本机私有检查点，启动时恢复；备份/归档会重新扫描并复核哈希。检查点不保存密码、GPS 或旧 PASS 状态。
-- 阶段⑤/⑥完整重检、来源重扫、路由/过滤修改、重复制、审核决定或备份映射修改会清除已知依赖结果。应用不实时监视外部文件改动；用户需重新扫描/校验，任务会重新读取文件并核对 SHA-256；阶段⑤复查确认先前异常已有效时会标记 `RESOLVED`。可读的元数据警告可逐项标记 `ACCEPTED`，该标记仅表示用户接受当前状态，不会消除警告，也不等同于 `RESOLVED`。
-- 任务支持当前进程内在安全边界暂停/恢复；关闭程序后可恢复阶段③未完成的分类复制计划、阶段⑦备份映射、阶段⑧归档输入和隔离还原选项，以及阶段⑥审核清单。阶段③会重验已有目标；阶段⑦会重新扫描来源并验证已有目标；阶段⑧要求重新输入密码，并重新扫描、从头重建和验证，不保存旧 PASS。归档先写临时单文件再切卷，峰值临时空间可能接近最终归档体积的两倍；严格还原校验还需要一份输入内容大小的临时空间；中断残留不会自动删除，已有输出不会覆盖。多卷最终提交遇到一般错误会回滚，但系统崩溃时多文件名无法作为一个原子事务提交。
-- 归档已在本机用官方 7-Zip 26.05 验证小卷互操作及 2,000,000,001 字节单文件的测试、提取和 SHA-256；未在 Windows、macOS Intel 或干净系统上做同等验收。程序提供可选隔离目录还原和磁盘重读 SHA-256 校验，会临时占用至少一份还原数据大小的空间。
-
-发布候选版的双平台断网/干净机器操作步骤见 [`docs/acceptance-checklist.md`](acceptance-checklist.md)。清单中的复选框必须以实际运行记录和证据为准；交叉编译不算目标系统运行验收。
-- 程序擦除自己持有的密码字符串；`sevenz-rust2` 内部密码缓冲区不保证主动擦零。
-- Rust 锁定依赖图的许可证文本和 attribution 已由 cargo-about 生成并嵌入窗口；Windows ExifTool/Strawberry Perl 发行包随附的 license 文本已提取到窗口和原始 ZIP 中。macOS ExifTool/PAR payload 的完整打包模块 attribution 仍需单独核验。生成说明见 `resources/THIRD_PARTY_NOTICES.md`。
-
-完整阶段现状及证据见 [`implementation-status.md`](implementation-status.md)。
+See the [clean-machine checklist](acceptance-checklist.md) before calling a package ready to distribute.

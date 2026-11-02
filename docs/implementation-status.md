@@ -1,60 +1,40 @@
-# 实施状态与离线交付可行性
+# Implementation status
 
-## 已落地
+**English | [简体中文](implementation-status.zh-CN.md)**
 
-- Rust 原生窗口，底部可直接进入八个阶段。
-- 阶段①可添加多个目录，递归列出常规文件、大小、mtime、扩展名，并显示错误样例。
-- 新加入的父目录会吸收重复的子目录；路径规范化后去重。
-- 扫描在后台线程运行，可取消；符号链接和特殊文件不会被递归跟随或当作照片计入。
-- 阶段①结束后提供携带清单、不携带清单、停留、退出四个选择。
-- 已在本机 macOS arm64 打开原生窗口与系统文件夹选择器；使用临时目录验证扫描计数和符号链接跳过。
-- 阶段②按扩展名显示路由行，可为每种扩展名选最终文件夹，多种扩展名可合并到同一目录，也可添加自定义扩展名规则；未映射类型会显式保留并提示。
-- 阶段③按默认清单过滤 `.DS_Store`、`._*`、`.Spotlight-V100`、`.Trashes`、`.fseventsd`、`Thumbs.db`、`desktop.ini`；界面可恢复包含。会预览未映射、目标已存在、目标重叠和重复路径；后台逐文件复制，目标存在时不覆盖，可重试未通过/未开始项。复制开始前会将路径及源文件大小/修改时间写入私有检查点；重启后用户可选择续跑，已有目标必须与当前源逐字节哈希匹配才认作完成。
-- 阶段④可复核本会话复制结果，也可独立选择源/目标目录并按相对路径核对文件数、缺失/多余项、大小及 SHA-256。校验会重新读取目标内容；已通过手工界面验证同大小目标改写会报告不一致。
-- 阶段⑤在 macOS arm64 构建中嵌入 ExifTool 13.60 与 Perl runtime；启动时验证有效载荷 SHA-256，在权限为 0700 的私有临时目录释放，退出后清理。Windows x86_64 构建嵌入官方 ExifTool/Perl ZIP，校验包与 EXE 哈希及版本后释放到用户本地运行时目录，使用 UTF-8 参数文件处理路径。两端均批量读取所选整理目录或本次复制目标并解析 JSON，不调用 PATH 中的外部工具。
-- 阶段⑤解析 GPS 纬度/经度及 QuickTime ISO 6709 坐标，校验坐标范围并保留有效的 `0,0`；按 EXIF 原始时间优先、视频 QuickTime 日期回退的顺序记录拍摄时间、精度、原始标签、时区状态和可选相机字段。没有把文件系统时间冒充拍摄时间；支持 `VALID`、`MISSING`、`PARTIAL`、`INVALID`、`UNSUPPORTED`、`READ_ERROR` 状态。完整重检会重新读取文件；原先非有效的 GPS 或拍摄时间字段单独转为 `VALID` 时，在对应字段标记 `RESOLVED`，其他字段仍显示当前真实状态。重检清除依赖旧内容的校验、重复审核、备份和归档恢复结果。用户可在当前会话逐项接受可读的元数据警告，显示 `ACCEPTED`；这不更改字段状态、不等同于修复，状态变化后接受记录会清除。
-- 阶段⑥可独立选目录并重新扫描，逐文件重算 SHA-256、分组字节完全相同文件；可信且带时区的拍摄时间按用户阈值逐对比较，避免传递闭包，并跳过已知不同设备。JPEG/PNG/HEIC/HEIF 候选计算 64-bit pHash；界面显示路径、哈希、时间差、汉明距离，支持并排预览（应用格式方向变换），并允许将具体路径标记为本次排除。HEIC/HEIF 使用内置 Heifer 纯 Rust 解码器，限制 5000 万像素，当前由生成 HEIC 样本覆盖；真实手机样本仍需验收。携带结果时，成功计算哈希且未排除的路径进入 Final Manifest；路径、SHA-256 和排除决定存入本机私有应用数据目录，重启后可恢复。阶段⑦/⑧仅在来源与清单目录重叠时限制为已确认路径，并在复制/归档前核对 SHA-256。界面可清除检查点；新一轮来源/重复扫描或选择不携带时也会清除。视频不参与 pHash，解码失败会显示原因。
-- 阶段⑦支持每个本地来源目录配置多个目标目录，扫描并保留相对路径，阻止来源/目标重叠及嵌套，再复制并重新读取源和每个目标逐文件验证 SHA-256。目标结果独立呈现；共享目标产生重名冲突时不覆盖并逐项报错。任务开始前保存来源/目标映射；重启后用户可选择重新扫描并续跑，已有目标必须重新通过 SHA-256，映射修改会清除恢复记录。
-- 已知输入变化会清除依赖结果：来源重扫、路由/过滤修改、重新复制、阶段⑤/⑥完整重检、阶段⑥阈值或排除决定修改、备份映射修改时会移除相应旧校验/审核/备份结果。程序仍不会持续监视文件系统；阶段间的外部改动需通过显式重新扫描/校验发现。
-- 阶段⑧可独立选择目录、输出目录、归档名和十进制每卷上限；GUI 双次确认密码后，使用 Store、AES-256 和加密归档头创建标准 7z 流。大于上限时，程序把完整临时流按字节切为 `.7z.001/.002/...`，再用拼接卷读取器逐项对比清单并流式校验每个文件 SHA-256；全部校验后才同步并以防覆盖硬链接提交。可选隔离还原校验会将归档真实写入权限受限的临时目录，重读文件并比较 SHA-256，完成后清理。显式排除路径会从输入清单剔除，归档内保留唯一顶层来源文件夹及后代目录。开始前会把来源、输出目录、归档名、卷大小、还原校验选项和适用的审核清单指纹写入私有检查点；重启后提示重新输入密码，并重新扫描、从头重建和验证。成功后删除检查点；中断或失败保留恢复入口，不会自动清除遗留临时文件。
-- 窗口底部可查看 ExifTool 声明及其 Artistic License、Windows ExifTool/Perl 包内许可证文本，并查看由 `cargo-about` 按锁定依赖生成的完整 Rust 依赖许可文本与 attribution（含目标平台依赖和字体许可）。macOS ExifTool/Perl/PAR payload 的全部打包模块 attribution 仍需单独核验。
-- 阶段①—⑧完成后均提供四选项交接；阶段②由用户显式确认分类完成，交接内容列出扩展名路由和未映射警告。⑧是终阶段，保留结果或不携带结果的选项会返回①；不携带会清除本次归档输入，但保留已写入磁盘的归档。其他阶段选择“不携带”会清除下一阶段会用到的本次清单/结果，并删除已存阶段⑥审核检查点。运行中切换可选择继续、取消后切换，或等待当前文件/扫描条目到安全边界后暂停并切换；跨阶段期间任务仍可从底栏恢复或取消。扫描、复制、校验、元数据、重复检查、备份和归档均支持当前进程内安全边界暂停/恢复。关闭程序后可恢复阶段③复制计划、阶段⑦备份映射、阶段⑧归档输入参数与隔离校验选项和阶段⑥审核清单。阶段⑧并非字节级续传；恢复会重新扫描并从头重建，且要求重新输入密码。
-- `sevenz-rust2` 加密归档已接入产品 UI：进程内密码、中文路径/密码、加密头、COPY 数据流和归档顶层目录通过本地流式 SHA-256 验证。切分得到的多卷序列已用官方 7-Zip 26.05 arm64 实测识别为 `Type = Split`，并以中文密码通过 `t`。超过默认 2,000,000,000 字节的单文件端到端用例通过：首卷 2,000,000,000 字节，末卷 298 字节；官方工具测试及提取均成功，提取文件 SHA-256 与同尺寸稀疏源文件一致。
-- 文件核心使用有界流式复制、源与临时目标 SHA-256、源扫描戳校验、mtime 保留，以及用同目录 hard-link 防覆盖提交。无法硬链接提交的文件系统会报错，不回退到可能覆盖的写法。
+This page summarizes the implemented workflows and what has actually been verified. Cross-compiling a target does not count as acceptance on that platform.
 
-## 高风险路径审查
+## Implemented workflows
 
-| 能力 | 当前结论 | 还需完成 |
-|---|---|---|
-| 原生窗口与文件夹选择 | Rust `eframe` + `rfd` 覆盖 macOS、Windows API；本机 macOS arm64 已实际点选。阶段①—④已通过临时文件夹 GUI 操作验证。 | 干净 Windows、干净 macOS 启动验证；严格单文件启动/分发验证。 |
-| ExifTool | macOS arm64：ExifTool 13.60 用 PAR::Packer 1.064 构建为独立 Mach-O，校验 SHA-256 后释放到 0700 私有临时目录，以 argv 批量读取 JSON；`otool -L` 仅显示系统依赖。在 JPEG GPS/拍摄时间、HEIC、MOV、CR2/CR3、NEF、RAF、DNG 和中文空格路径样本上通过。macOS x86_64：同版本代码用 x86_64 Perl 5.34.1 / PAR::Packer 1.064 重打包为独立 Intel Mach-O；SHA-256 已固定、`otool -L` 仅显示系统库，并已在 Rosetta 下以清空环境启动返回 13.60；Intel 目标编译的应用测试也在 Rosetta 下成功释放并启动它。Windows x86_64：嵌入官方 ExifTool 13.60 ZIP（与 SourceForge SHA-256 一致），启动时校验 ZIP/释放 EXE 哈希及版本，释放到 `%LOCALAPPDATA%` 私有目录；使用 UTF-8 参数文件处理中文路径。 | macOS Intel 尚需在 Intel 实机/干净系统验收；Windows 实机和干净系统 GUI/ExifTool 验收未完成；macOS 裸 Mach-O Finder/Gatekeeper 验收未完成。 |
-| 加密 7z | GUI、加密头、Store、流式 manifest/SHA-256 校验、可选隔离目录还原重读校验和 `.7z.001/.002/...` 逻辑分卷已实现。官方 7-Zip 26.05 arm64 对应用生成的小卷样本与 2,000,000,001 字节单文件归档均识别为 `Type = Split`，中文密码 `t`、大文件提取和提取后 SHA-256 比对成功。验证工具仅下载到临时目录，没有随程序发布。 | `sevenz-rust2` writer 本身不提供原生多卷；当前先写完整临时归档再切卷，峰值临时空间可能接近最终归档的两倍；严格还原校验还会临时占用一份还原数据大小的空间。程序清理自身密码字符串，但库内部 `Password` 缓冲区不保证主动擦零；跨平台与干净系统验收尚未做。 |
-| HEIC/HEIF 预览解码 | JPEG/PNG 与 HEIC/HEIF 可计算 pHash 并并排预览。HEIF 解码通过内置纯 Rust Heifer 0.3.17，最多 5000 万像素；用编码生成的 HEIC 样本通过测试。 | 需要真实手机/相机 HEIC 与干净系统验收；尚未优先提取内嵌预览，也没有 RAW 解码。失败格式只显示不可计算，不会误报相似。 |
+The app has eight directly accessible stages: scan folders; set extension-based organization rules; copy files; verify copies; inspect metadata; review exact and visual duplicate candidates; back up to multiple targets; and create encrypted 7z archives.
 
-## 当前构建环境与限制
+- Scanning runs in the background, can be cancelled, and skips symbolic links and special files. Parent and child folder selections are normalized to avoid scanning the same files twice.
+- Organization and backup copies retain relative paths, stream file data, compare SHA-256, and avoid overwriting existing destinations. Checkpoints can restore selected copy plans and backup mappings after restart; resumed tasks reread and verify files.
+- Metadata inspection reads GPS and capture-time fields through the bundled ExifTool runtime. It distinguishes missing, partial, invalid, unsupported, and read-error states. A user may acknowledge a warning without changing the field state.
+- Duplicate review finds byte-identical files and image candidates for JPEG, PNG, HEIC, and HEIF. Candidate groups can be previewed side by side and excluded. Video does not participate in perceptual-hash comparison.
+- Archive creation uses encrypted 7z Store mode, supports split volumes, and checks paths and SHA-256 before committing. Optional isolated restore verification rereads restored files. A resumed archive task requires the password again and rebuilds from the beginning.
+- The interface supports US English and Simplified Chinese. English is the first-run default; the visible **English** and **中文** controls switch immediately without restarting and remember the selection.
 
-- 开发主机：macOS arm64；Rust 1.99.1，已安装 `aarch64-apple-darwin`、`x86_64-apple-darwin` 与 `x86_64-pc-windows-gnu` target，以及 MinGW-w64 14.0.0。`scripts/build-macos-x86_64.sh` 可交叉构建 macOS Intel GUI；`scripts/build-windows-x86_64.sh` 可重建 Windows GUI PE。
-- 本机可交叉编译 Windows 源码，不等于 Windows 实机或干净系统验收；当前没有干净 Windows/macOS 运行证据。
-- macOS arm64 与 Intel Release 目标均已构建；Intel 产物 `target/x86_64-apple-darwin/release/photo-archive-manager` 为约 23 MB x86_64 Mach-O，并通过 Rosetta 下的嵌入 ExifTool 冒烟用例。两种架构均尚未作为裸 GUI 文件在干净系统、Finder 或 Gatekeeper 流程中验收。
-- macOS `.app` 是目录形式，不能代替严格单物理文件要求。裸 Mach-O GUI 的系统启动、文件选择器与分发行为尚未验证。
-- Windows Release 产物 `target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe` 为约 20 MB PE32+ GUI；PE 导入表只列 Windows 系统 DLL/UCRT API，不含 MinGW 运行时 DLL。尚未用 Windows 实机启动这个交叉构建产物。
-- 阶段②目前是逐扩展名路由，还没有来源级规则、同名冲突重命名或可用空间 dry run。新阶段③复制遇到已存在目标时只报错；恢复任务会重新比较同名目标和源的 SHA-256，一致才继续。
-- 阶段④的独立目录模式按相对路径匹配；Windows 大小写/UNC、macOS Unicode 规范化、权限/扩展属性、超大规模目录和外接盘掉线恢复尚未验收。
-- 阶段⑥支持 JPEG/PNG/HEIC/HEIF 并排预览与 pHash；HEIF 解码受 5000 万像素限制。尚无 RAW 解码、HEIF 内嵌预览优先策略或 Final Manifest 导出。携带审核结果后，路径、哈希和排除决定保存在私有检查点，但其他阶段数据仍只在本次会话中。
-- 阶段③退出恢复会按原计划重试：已存在目标重新读取源/目标并比对 SHA-256，通过才算完成；源大小/修改时间变化或内容不匹配会报错，不覆盖。该检查点不含密码和元数据，也不包含分类规则 UI 状态。
-- 阶段⑦退出恢复会重新扫描映射来源，并重新执行复制与目标哈希验证；已有且内容一致的目标可通过复核，不一致时不会覆盖。检查点保存的是映射，不保存旧 PASS 或单文件完成状态；系统崩溃后目标目录里的额外文件仍会被报告。
-- 阶段⑧已有产品 UI、分卷加密 Store 校验、退出后输入参数恢复和可选隔离目录还原校验；检查点不包含密码、文件清单或旧 PASS。恢复会从头扫描并重建；被强制结束时产生的临时文件不会自动清理，重跑遇到已有输出会拒绝覆盖。严格还原校验需要额外可容纳一份还原内容的临时空间。
-- 阶段⑥人工排除决定不会物理删除文件；携带后路径、哈希和排除决定保存在权限受限的本机应用数据检查点，启动时恢复。编辑已携带的排除决定会重建清单并更新检查点。备份/归档仍重新扫描并复核内容哈希；检查点不包含密码、GPS、元数据结果或旧 PASS 状态，也不等于通用阶段恢复。
-- macOS arm64 ExifTool 已在本机样本上运行；macOS Intel 应用已交叉构建，并在 Rosetta 下通过一个嵌入工具运行用例，完整元数据样本和 Intel 实机验收仍待完成；Windows ExifTool 有效载荷已做静态封装/哈希/版本校验并交叉编译，不等于 Windows 实机或干净系统验收。
-- 本机 `cargo test --locked` 最近一次结果：54 passed、0 failed、3 ignored（两项需要外部 ExifTool 样本、一项需显式运行的 2 GB 压力用例）。覆盖 JPEG/PNG 与生成 HEIC 样本预览、HEIC pHash、元数据复查 `RESOLVED`/`ACCEPTED` 状态、暂停后切换的安全边界确认、阶段③复制检查点序列化/源时间戳恢复、目标匹配恢复和冲突拒绝、阶段⑦映射检查点往返与相对目标路径拒绝及警告分类、阶段⑧归档输入检查点、审核指纹和隔离还原校验、阶段⑥检查点往返/权限和审核排除清单重建、Windows 官方 ExifTool ZIP 解包校验和 UTF-8 参数文件；压力用例此前已用 Release 配置通过，完整流式处理 2,000,000,001 字节单文件，按十进制 2,000,000,000 字节切卷并通过应用内 SHA-256 验证。
-- `scripts/build-macos-arm64.sh` 与 `scripts/build-macos-x86_64.sh` 均已成功；arm64 与 Intel 产物各约 23 MB，`otool -L` 仅显示 Apple 系统框架与系统库。Windows 脚本生成了约 21 MB GUI PE，且无 MinGW DLL 依赖。三种产物均未在干净系统上全流程验收；Windows PE 未在 Windows 实机启动，Intel GUI 仅在 Rosetta 下运行嵌入 ExifTool 冒烟用例。
-- 2026-11-02 使用从 [7-Zip 官方下载页](https://www.7-zip.org/download.html) 获取的 7-Zip 26.05 macOS arm64 验证应用生成的多卷归档：100 字节测试卷被识别为 `Type = Split`、`Volumes = 4` 并通过 `7zz t`；默认大小测试首卷为 2,000,000,000 字节，官方工具识别两卷、`7zz t` 通过并成功提取 2,000,000,001 字节文件。提取文件和同尺寸稀疏输入的 SHA-256 均为 `455f84a8f75731bc92566d751017b278e7ead58533b68f4b7a390c01fef4f1a9`。验证程序位于临时目录，没有捆入产品；测试密码通过终端交互输入。
-- 生成的 `target/` 是开发产物，不是经过签名、公证或干净系统离线验收的发布包；不宣称 Windows 或最终单文件交付已达标。
+## Build and package outputs
 
-## 核查资料
+The platform binaries have stable target-specific paths, and the release packager writes versioned, architecture-labelled ZIPs under `target/Releases/`. macOS ZIPs contain a `Photo Archive Manager.app` bundle. The [release guide](release.md) lists exact names and rebuild commands.
 
-- [rfd 原生文件对话框文档](https://docs.rs/rfd/latest/rfd/)
-- [ExifTool 官方安装说明](https://exiftool.org/install.html)
-- [7z 格式与 AES-256 说明](https://www.7-zip.org/7z.html)
-- [sevenz-rust2 文档与源码](https://github.com/hasenbanck/sevenz-rust2)
-- [libheif 源码与构建说明](https://github.com/strukturag/libheif)
+The ZIP packager sorts entries, fixes their timestamps, includes checksums, and records the platform acceptance status. This makes archive metadata predictable; compiled binaries are not promised to be bit-for-bit identical across different toolchains.
+
+## Verification evidence
+
+- On the Apple Silicon build host, native window and folder-picker use and temporary-folder scanning have been exercised. The arm64 app includes the ExifTool/Perl runtime; its build checks the payload digest and remaps repository and Cargo cache paths.
+- The macOS Intel target has a Rosetta smoke check for the app and its embedded ExifTool. This does not replace testing on Intel hardware.
+- The Windows x86_64 app is cross-compiled and checked for the GUI subsystem and unexpected MinGW runtime DLL imports. It has not yet been run through full workflows on Windows.
+- The locked Rust test suite previously passed 54 tests, with 3 ignored cases (two requiring external ExifTool fixtures and one explicit 2 GB archive stress case). A 2,000,000,001-byte archive case and official 7-Zip interoperability were also recorded as passing on the build host.
+- HEIC/HEIF preview decoding has been exercised with generated HEIC samples. Real camera and phone sample coverage is still needed.
+
+## Remaining acceptance work
+
+- Run offline, clean-machine startup and full workflows on macOS arm64, macOS Intel, and Windows x86_64.
+- Sign and notarize macOS packages; verify Finder launch, file pickers, Dock behavior, and Gatekeeper distribution.
+- Test real-device HEIC/HEIF samples and platform-specific path, permission, and removable-drive behavior.
+- Validate large archive temporary-space requirements. The implementation writes a complete temporary archive before splitting; peak temporary use can approach twice the final archive size. Isolated restore checking also needs space for a restored copy.
+- The archive dependency's internal password buffer is not guaranteed to be zeroized. The app clears its own password strings.
+
+See the [acceptance checklist](acceptance-checklist.md) for the remaining hands-on checks and the [technical design](technical-design.md) for safety flows.
