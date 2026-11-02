@@ -283,6 +283,7 @@ struct PhotoArchiveApp {
         Result<eframe::egui::TextureHandle, String>,
     )>,
     backup_mappings: Vec<BackupMapping>,
+    pending_backup_resume: Option<Vec<BackupMapping>>,
     backup_copies: Vec<CopyItemResult>,
     backup_verification: Vec<VerifyItemResult>,
     archive_source: Option<PathBuf>,
@@ -1524,7 +1525,44 @@ impl PhotoArchiveApp {
         }
         if mappings_changed {
             self.clear_backup_results();
-            self.status = "备份映射已修改；旧备份校验结果已清除。".into();
+            self.pending_backup_resume = None;
+            let checkpoint_error = checkpoint::clear_pending_backup().err();
+            self.status = checkpoint_error.map_or_else(
+                || "备份映射已修改；旧备份校验结果已清除。".into(),
+                |error| format!("备份映射已修改，旧结果已清除；删除过期检查点失败：{error}"),
+            );
+        }
+
+        if let Some(mappings) = self.pending_backup_resume.as_ref() {
+            let target_count = mappings
+                .iter()
+                .map(|mapping| mapping.targets.len())
+                .sum::<usize>();
+            ui.separator();
+            ui.label(format!(
+                "发现上次未完成的备份任务：{} 个来源、{target_count} 个目标。恢复会重新扫描来源，并校验已有目标；不会覆盖不匹配的文件。",
+                mappings.len()
+            ));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.work_running,
+                        eframe::egui::Button::new("重新扫描并恢复备份"),
+                    )
+                    .clicked()
+                {
+                    self.resume_pending_backup();
+                }
+                if ui
+                    .add_enabled(
+                        !self.work_running,
+                        eframe::egui::Button::new("丢弃备份恢复记录"),
+                    )
+                    .clicked()
+                {
+                    self.discard_pending_backup();
+                }
+            });
         }
 
         let ready = self
@@ -1534,12 +1572,12 @@ impl PhotoArchiveApp {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !self.work_running && ready,
+                    !self.work_running && ready && self.pending_backup_resume.is_none(),
                     eframe::egui::Button::new("开始 / 重试复制并校验"),
                 )
                 .clicked()
             {
-                self.start_backup(false);
+                self.start_backup(false, false);
             }
             if ui
                 .add_enabled(
@@ -1548,7 +1586,7 @@ impl PhotoArchiveApp {
                 )
                 .clicked()
             {
-                self.start_backup(true);
+                self.start_backup(true, false);
             }
             if self.work_running
                 && self.work_kind == Some(WorkKind::Backup)
@@ -1884,15 +1922,31 @@ impl PhotoArchiveApp {
         });
     }
 
-    fn start_backup(&mut self, verify_only: bool) {
+    fn start_backup(&mut self, verify_only: bool, resume_existing: bool) {
         if self.work_running {
             return;
         }
         let mappings = self.backup_mappings.clone();
         let invalid = backup_mapping_errors(&mappings);
         if !invalid.is_empty() {
+            if resume_existing {
+                self.pending_backup_resume = Some(mappings);
+            }
             self.status = invalid.join("；");
             return;
+        }
+        if !verify_only {
+            let saved = mappings
+                .iter()
+                .filter_map(saved_backup_mapping)
+                .collect::<Vec<_>>();
+            if let Err(error) = checkpoint::save_pending_backup(&saved) {
+                if resume_existing {
+                    self.pending_backup_resume = Some(mappings);
+                }
+                self.status = format!("无法保存备份恢复检查点，未开始备份：{error}");
+                return;
+            }
         }
         if !verify_only {
             self.backup_copies.clear();
@@ -1905,6 +1959,8 @@ impl PhotoArchiveApp {
         self.work_running = true;
         self.status = if verify_only {
             "正在重新扫描源目录与现有备份目标…".into()
+        } else if resume_existing {
+            "正在重新扫描备份来源并续跑；已有目标会重新校验…".into()
         } else {
             "正在扫描本地整理目录并准备独立备份目标…".into()
         };
@@ -2102,14 +2158,18 @@ impl PhotoArchiveApp {
                 });
                 return;
             }
-            let (copies, cancelled_copy) =
-                pipeline::copy_batch(items, &worker_control, |completed, total, bytes| {
-                    let _ = sender.send(WorkMessage::BackupProgress {
-                        completed,
-                        total: total.saturating_mul(2),
-                        bytes,
-                    });
+            let progress = |completed: usize, total: usize, bytes: u64| {
+                let _ = sender.send(WorkMessage::BackupProgress {
+                    completed,
+                    total: total.saturating_mul(2),
+                    bytes,
                 });
+            };
+            let (copies, cancelled_copy) = if resume_existing {
+                pipeline::resume_copy_batch(items, &worker_control, progress)
+            } else {
+                pipeline::copy_batch(items, &worker_control, progress)
+            };
             let pairs = copies
                 .iter()
                 .filter(|item| item.result.is_ok())
@@ -2486,6 +2546,9 @@ impl PhotoArchiveApp {
         }
         let saved_items = items.iter().map(saved_copy_item).collect::<Vec<_>>();
         if let Err(error) = checkpoint::save_pending_copy(&saved_items) {
+            if resume_existing {
+                self.pending_copy_resume = Some(items);
+            }
             self.status = format!("无法保存文件复制恢复检查点，未开始复制：{error}");
             return;
         }
@@ -2904,6 +2967,24 @@ impl PhotoArchiveApp {
                     self.work_kind = None;
                     self.work_receiver = None;
                     self.work_control = None;
+                    let backup_incomplete = cancelled
+                        || backup_error_requires_retry(error.as_deref())
+                        || copies.iter().any(|item| item.result.is_err())
+                        || verification
+                            .iter()
+                            .any(|item| !item.result.as_ref().is_ok_and(|result| result.matches));
+                    if !verify_only {
+                        if backup_incomplete {
+                            self.pending_backup_resume = Some(self.backup_mappings.clone());
+                        } else {
+                            self.pending_backup_resume = None;
+                            if let Err(error) = checkpoint::clear_pending_backup() {
+                                self.status = format!(
+                                    "备份已完成，但无法清除恢复检查点：{error}。下次启动会重新扫描并核对目标。"
+                                );
+                            }
+                        }
+                    }
                     let copied = copies.iter().filter(|item| item.result.is_ok()).count();
                     let copy_failed = copies.len().saturating_sub(copied);
                     let verified = verification
@@ -2918,7 +2999,7 @@ impl PhotoArchiveApp {
                     let warning = error.unwrap_or_default();
                     if cancelled {
                         self.status = format!(
-                            "备份已取消：复制成功 {copied} 项、失败 {copy_failed} 项；读回校验 PASS {verified} 项、FAIL {verify_failed} 项。未完成项需重新扫描。{warning}"
+                            "备份已取消：复制成功 {copied} 项、失败 {copy_failed} 项；读回校验 PASS {verified} 项、FAIL {verify_failed} 项。恢复记录已保存，下次可重新扫描并继续。{warning}"
                         );
                         self.apply_pending_stage();
                     } else if verify_only {
@@ -2937,7 +3018,7 @@ impl PhotoArchiveApp {
                         );
                         self.handoff_title = "文件备份已完成".into();
                         self.handoff_description = format!(
-                            "各所选备份目标分别执行了复制和逐文件 SHA-256 读回验证：复制成功 {copied} 项、失败 {copy_failed} 项；校验 PASS {verified} 项、FAIL {verify_failed} 项。结果按目标路径保留在本次会话内存中。{warning}"
+                            "各所选备份目标分别执行了复制和逐文件 SHA-256 读回验证：复制成功 {copied} 项、失败 {copy_failed} 项；校验 PASS {verified} 项、FAIL {verify_failed} 项。未完成映射会保存在本机私有检查点；下次可重新扫描源并校验已有目标。{warning}"
                         );
                         self.show_handoff = !self.apply_pending_stage();
                     }
@@ -3089,6 +3170,8 @@ impl PhotoArchiveApp {
                 ui.label(format!("阶段任务：{operation}"));
             } else if self.pending_copy_resume.is_some() {
                 ui.label("阶段状态：发现可恢复的分类复制任务");
+            } else if self.pending_backup_resume.is_some() {
+                ui.label("阶段状态：发现可恢复的备份任务");
             } else if self.last_scan.is_some() {
                 ui.label("阶段状态：已扫描（来源文件清单保存在当前会话内存中）");
             } else {
@@ -3267,6 +3350,49 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn restore_pending_backup(&mut self) {
+        match checkpoint::load_pending_backup() {
+            Ok(Some(saved)) => {
+                let mappings = saved
+                    .into_iter()
+                    .map(restored_backup_mapping)
+                    .collect::<Vec<_>>();
+                self.backup_mappings = mappings.clone();
+                self.pending_backup_resume = Some(mappings);
+                if self.pending_copy_resume.is_none() {
+                    self.stage = 6;
+                    self.status =
+                        "发现上次未完成的备份任务。阶段⑦可选择重新扫描并恢复；已有目标会重新校验。"
+                            .into();
+                } else {
+                    self.status = "发现未完成的分类复制和备份任务；可从阶段③或⑦分别恢复。".into();
+                }
+            }
+            Ok(None) => self.pending_backup_resume = None,
+            Err(error) => {
+                self.status = format!("无法读取上次备份检查点：{error}。现有文件未被修改。");
+            }
+        }
+    }
+
+    fn resume_pending_backup(&mut self) {
+        let Some(mappings) = self.pending_backup_resume.take() else {
+            return;
+        };
+        self.backup_mappings = mappings;
+        self.start_backup(false, true);
+    }
+
+    fn discard_pending_backup(&mut self) {
+        self.pending_backup_resume = None;
+        match checkpoint::clear_pending_backup() {
+            Ok(()) => self.status = "已丢弃备份恢复记录；现有目标文件未删除。".into(),
+            Err(error) => {
+                self.status = format!("无法删除备份恢复检查点：{error}；现有文件未修改。")
+            }
+        }
+    }
+
     fn resume_pending_copy(&mut self) {
         let Some(items) = self.pending_copy_resume.take() else {
             return;
@@ -3312,6 +3438,10 @@ impl PhotoArchiveApp {
         self.review_checkpoint_saved = false;
         self.excluded_final_paths.clear();
         self.clear_backup_results();
+        self.pending_backup_resume = None;
+        if let Err(error) = checkpoint::clear_pending_backup() {
+            self.status = format!("无法清除过期备份检查点：{error}");
+        }
         if let Err(error) = checkpoint::clear() {
             self.status = format!("无法清除本机阶段⑥恢复检查点：{error}");
         }
@@ -3667,6 +3797,14 @@ fn append_task_error(error: &mut Option<String>, message: impl Into<String>) {
     });
 }
 
+fn backup_error_requires_retry(error: Option<&str>) -> bool {
+    error.is_some_and(|error| {
+        error.split('；').any(|part| {
+            !part.starts_with("按阶段⑥决定排除了") && !part.starts_with("最终清单之外的")
+        })
+    })
+}
+
 fn inspect_backup_targets(
     expected_by_target: &BTreeMap<PathBuf, (PathBuf, std::collections::BTreeSet<PathBuf>)>,
     control: &TaskControl,
@@ -4004,6 +4142,20 @@ fn restored_copy_item(item: checkpoint::SavedCopyItem) -> std::io::Result<Routed
     })
 }
 
+fn saved_backup_mapping(mapping: &BackupMapping) -> Option<checkpoint::SavedBackupMapping> {
+    Some(checkpoint::SavedBackupMapping {
+        source: mapping.source.clone()?,
+        targets: mapping.targets.clone(),
+    })
+}
+
+fn restored_backup_mapping(mapping: checkpoint::SavedBackupMapping) -> BackupMapping {
+    BackupMapping {
+        source: Some(mapping.source),
+        targets: mapping.targets,
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -4021,6 +4173,7 @@ fn main() -> eframe::Result {
             let mut app = PhotoArchiveApp::default();
             app.restore_saved_review();
             app.restore_pending_copy();
+            app.restore_pending_backup();
             Ok(Box::new(app))
         }),
     )
@@ -4065,6 +4218,17 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn accepted_backup_exclusions_do_not_keep_an_incomplete_checkpoint() {
+        assert!(!backup_error_requires_retry(Some(
+            "按阶段⑥决定排除了 2 个目标文件项；最终清单之外的 1 个目标文件项未备份"
+        )));
+        assert!(backup_error_requires_retry(Some(
+            "扫描照片目录时有 1 项读取错误"
+        )));
+        assert!(!backup_error_requires_retry(None));
     }
 
     #[test]

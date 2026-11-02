@@ -25,10 +25,116 @@ pub struct SavedCopyItem {
     pub expected_sha256: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SavedBackupMapping {
+    pub source: PathBuf,
+    pub targets: Vec<PathBuf>,
+}
+
 #[derive(Deserialize, Serialize)]
 struct PendingCopyCheckpoint {
     version: u8,
     items: Vec<SavedCopyItem>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PendingBackupCheckpoint {
+    version: u8,
+    mappings: Vec<SavedBackupMapping>,
+}
+
+pub fn save_pending_backup(mappings: &[SavedBackupMapping]) -> io::Result<()> {
+    write_pending_backup_to(&pending_backup_path()?, mappings)
+}
+
+fn write_pending_backup_to(path: &Path, mappings: &[SavedBackupMapping]) -> io::Result<()> {
+    validate_pending_backup(mappings)?;
+    write_json_atomically(
+        path,
+        &PendingBackupCheckpoint {
+            version: 1,
+            mappings: mappings.to_vec(),
+        },
+    )
+}
+
+pub fn load_pending_backup() -> io::Result<Option<Vec<SavedBackupMapping>>> {
+    read_pending_backup_from(&pending_backup_path()?)
+}
+
+fn read_pending_backup_from(path: &Path) -> io::Result<Option<Vec<SavedBackupMapping>>> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "备份任务检查点必须是普通文件",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let data = fs::read(path)?;
+    let checkpoint: PendingBackupCheckpoint =
+        serde_json::from_slice(&data).map_err(io::Error::other)?;
+    if checkpoint.version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "不支持的备份任务检查点版本",
+        ));
+    }
+    validate_pending_backup(&checkpoint.mappings)?;
+    Ok(Some(checkpoint.mappings))
+}
+
+fn validate_pending_backup(mappings: &[SavedBackupMapping]) -> io::Result<()> {
+    if mappings.is_empty() || mappings.len() > 1_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "备份任务映射数量无效",
+        ));
+    }
+    let mut sources = BTreeSet::new();
+    for mapping in mappings {
+        if !mapping.source.is_absolute()
+            || !sources.insert(mapping.source.clone())
+            || mapping.targets.is_empty()
+            || mapping.targets.len() > 1_000
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "备份任务来源或目标数量无效",
+            ));
+        }
+        let mut targets = BTreeSet::new();
+        if mapping
+            .targets
+            .iter()
+            .any(|target| !target.is_absolute() || !targets.insert(target.clone()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "备份任务目标路径无效或重复",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn clear_pending_backup() -> io::Result<()> {
+    match fs::remove_file(pending_backup_path()?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn save_pending_copy(items: &[SavedCopyItem]) -> io::Result<()> {
@@ -149,6 +255,10 @@ fn checkpoint_path() -> io::Result<PathBuf> {
 
 fn pending_copy_path() -> io::Result<PathBuf> {
     Ok(checkpoint_dir()?.join("unfinished-copy.json"))
+}
+
+fn pending_backup_path() -> io::Result<PathBuf> {
+    Ok(checkpoint_dir()?.join("unfinished-backup.json"))
 }
 
 fn checkpoint_dir() -> io::Result<PathBuf> {
@@ -416,6 +526,13 @@ mod tests {
         }
     }
 
+    fn sample_backup_mapping(root: &Path) -> SavedBackupMapping {
+        SavedBackupMapping {
+            source: root.join("organized"),
+            targets: vec![root.join("disk-a"), root.join("disk-b")],
+        }
+    }
+
     #[test]
     fn checkpoint_round_trips_review_and_exclusions() {
         let dir = temp_path();
@@ -481,6 +598,33 @@ mod tests {
         second.source = dir.join("other.jpg");
         assert_eq!(
             write_pending_copy_to(&path, &[first, second])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_backup_checkpoint_round_trips_each_mapping() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-backup.json");
+        let mappings = vec![sample_backup_mapping(&dir)];
+        write_pending_backup_to(&path, &mappings).unwrap();
+        assert_eq!(read_pending_backup_from(&path).unwrap(), Some(mappings));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_backup_checkpoint_rejects_relative_targets() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-backup.json");
+        let mut mapping = sample_backup_mapping(&dir);
+        mapping.targets.push(PathBuf::from("relative-target"));
+        assert_eq!(
+            write_pending_backup_to(&path, &[mapping])
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData
