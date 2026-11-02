@@ -37,9 +37,7 @@ const STAGES: [&str; 8] = [
 
 const LICENSE_NOTICES: &str = include_str!("../resources/THIRD_PARTY_NOTICES.md");
 const EXIFTOOL_LICENSE: &str = include_str!("../resources/exiftool/Artistic-License-1.0.pod");
-const SEVENZ_LICENSE: &str = include_str!("../resources/licenses/Apache-2.0-sevenz-rust2.txt");
-const ZEROIZE_APACHE_LICENSE: &str = include_str!("../resources/licenses/Apache-2.0-zeroize.txt");
-const ZEROIZE_MIT_LICENSE: &str = include_str!("../resources/licenses/MIT-zeroize.txt");
+const RUST_DEPENDENCY_LICENSES: &str = include_str!("../resources/licenses/RUST_DEPENDENCIES.md");
 
 #[derive(Clone, Debug)]
 struct SourceRoot {
@@ -3016,9 +3014,7 @@ impl PhotoArchiveApp {
                 let choices = [
                     "第三方声明",
                     "ExifTool · Artistic License 1.0",
-                    "sevenz-rust2 · Apache-2.0",
-                    "zeroize · Apache-2.0",
-                    "zeroize · MIT",
+                    "Rust 依赖完整许可清单",
                 ];
                 eframe::egui::ComboBox::from_label("查看文本")
                     .selected_text(choices[self.license_choice.min(choices.len() - 1)])
@@ -3029,9 +3025,7 @@ impl PhotoArchiveApp {
                     });
                 let text = match self.license_choice {
                     1 => EXIFTOOL_LICENSE,
-                    2 => SEVENZ_LICENSE,
-                    3 => ZEROIZE_APACHE_LICENSE,
-                    4 => ZEROIZE_MIT_LICENSE,
+                    2 => RUST_DEPENDENCY_LICENSES,
                     _ => LICENSE_NOTICES,
                 };
                 eframe::egui::ScrollArea::vertical()

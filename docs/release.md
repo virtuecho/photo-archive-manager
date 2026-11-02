@@ -30,6 +30,6 @@ cargo test --release archive::tests::archives_a_single_file_larger_than_the_defa
 - 备份没有暂停/断点恢复。归档先写临时单文件再切卷，峰值临时空间可能接近最终归档体积的两倍；多卷最终提交遇到一般错误会回滚，但系统崩溃时多文件名无法作为一个原子事务提交。
 - 归档已在本机用官方 7-Zip 26.05 验证小卷互操作及 2,000,000,001 字节单文件的测试、提取和 SHA-256；未在 Windows、macOS Intel 或干净系统上做同等验收。程序内没有“恢复到隔离目录”的单独严格校验模式。
 - 程序擦除自己持有的密码字符串；`sevenz-rust2` 内部密码缓冲区不保证主动擦零。
-- 第三方声明和部分直接依赖许可证已嵌入窗口；完整传递依赖许可证审计未完成。
+- Rust 锁定依赖图的许可证文本和 attribution 已由 cargo-about 生成并嵌入窗口；ExifTool/Perl/PAR payload 的全部打包模块 attribution 仍需单独核验。生成说明见 `resources/THIRD_PARTY_NOTICES.md`。
 
 完整阶段现状及证据见 [`implementation-status.md`](implementation-status.md)。
