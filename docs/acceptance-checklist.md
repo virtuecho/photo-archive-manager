@@ -6,7 +6,7 @@
 
 - macOS arm64 开发构建：`target/aarch64-apple-darwin/release/photo-archive-manager`。本机 arm64 已运行验证；该文件尚未签名、公证，也不是 `.app` 发布包。
 - Windows x86_64 开发构建：`target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe`。已从 macOS 交叉编译；Windows 实机启动和离线验收尚未完成。
-- macOS Intel 尚无对应 ExifTool 有效载荷或发布构建。
+- macOS Intel 开发构建：`target/x86_64-apple-darwin/release/photo-archive-manager`。Intel 目标应用已在 Rosetta 下通过嵌入 ExifTool 运行用例；Intel 实机和干净机器离线验收仍待完成。
 - 目前 HEIC/HEIF 覆盖由程序生成的样本完成；真实相机/手机样本仍待验收。
 
 ## 验收记录
@@ -88,5 +88,5 @@
 
 - [ ] 在断网的干净 macOS arm64 机器运行单个发布文件，验证 ExifTool、元数据、HEIC/HEIF、备份和加密分卷归档。
 - [ ] 验证 Finder 启动、文件夹选择、Dock、签名、公证及 Gatekeeper；严格单文件目标和 `.app` bundle 的差异必须在发布说明中明确。
-- [ ] macOS Intel 只有在提供对应 ExifTool 有效载荷和 x86_64 构建后才能执行相同验收；不得用 arm64 结果替代。
+- [ ] 使用 `scripts/build-macos-x86_64.sh` 产物，在断网的干净 macOS Intel 机器运行并完成相同验收；不得用 arm64 或 Rosetta 结果替代 Intel 实机结果。
 

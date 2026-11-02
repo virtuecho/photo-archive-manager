@@ -4605,6 +4605,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn metadata_warning_acceptance_matches_current_status_and_excludes_read_errors() {
+        let path = PathBuf::from("accepted.jpg");
+        let mut warning = MetadataRecord::unsupported(path.clone(), "");
+        warning.gps_status = MetadataStatus::Missing;
+        warning.time_status = MetadataStatus::Valid;
+        let accepted = BTreeMap::from([(
+            path.clone(),
+            (MetadataStatus::Missing, MetadataStatus::Valid),
+        )]);
+
+        assert!(metadata_record_is_warning(&warning));
+        assert_eq!(
+            accepted_metadata_warning_count(&[warning.clone()], &accepted),
+            1
+        );
+
+        let mut changed = warning;
+        changed.gps_status = MetadataStatus::Partial;
+        assert_eq!(accepted_metadata_warning_count(&[changed], &accepted), 0);
+
+        let mut read_error = MetadataRecord::unsupported(path, "read error");
+        read_error.gps_status = MetadataStatus::ReadError;
+        assert!(!metadata_record_is_warning(&read_error));
+    }
+
     fn temp_dir() -> PathBuf {
         let suffix = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(

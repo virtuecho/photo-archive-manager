@@ -1,9 +1,9 @@
 use std::{path::PathBuf, process::Command};
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 use std::io::Write;
 #[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "macos",
     all(target_os = "windows", target_arch = "x86_64"),
     test
 ))]
@@ -14,7 +14,7 @@ use std::{
 
 use serde_json::Value;
 #[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "macos",
     all(target_os = "windows", target_arch = "x86_64"),
     test
 ))]
@@ -26,6 +26,8 @@ const FILES_PER_BATCH: usize = 64;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const EXIFTOOL_SHA256: &str = "224c4384d1df807c14f6ebcb04972ab5b918cac076b9dc4cebc99da981ed0b95";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const EXIFTOOL_SHA256: &str = "cbd028efc28cee50fe5418dd63b14797c76039d636746425cd79f53917954ac6";
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const EXIFTOOL_WINDOWS_ZIP_SHA256: &str =
     "548b1f4e0b713cd2a26824b34080c35db4e2d2edd166468eb38b1d55ada90c2e";
@@ -35,6 +37,8 @@ const EXIFTOOL_WINDOWS_EXE_SHA256: &str =
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const EXIFTOOL_PAYLOAD: &[u8] = include_bytes!("../resources/exiftool/macos-aarch64/exiftool");
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const EXIFTOOL_PAYLOAD: &[u8] = include_bytes!("../resources/exiftool/macos-x86_64/exiftool");
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const EXIFTOOL_WINDOWS_PAYLOAD: &[u8] =
     include_bytes!("../resources/exiftool/windows-x86_64/exiftool-13.60_64.zip");
@@ -149,14 +153,14 @@ impl MetadataRecord {
 
 pub fn embedded_tool_available() -> bool {
     #[cfg(any(
-        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "macos",
         all(target_os = "windows", target_arch = "x86_64")
     ))]
     {
         true
     }
     #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "macos",
         all(target_os = "windows", target_arch = "x86_64")
     )))]
     {
@@ -169,12 +173,16 @@ pub fn embedded_tool_version() -> &'static str {
     {
         "ExifTool 13.60 · macOS arm64"
     }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "ExifTool 13.60 · macOS x86_64"
+    }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
         "ExifTool 13.60 · Windows x86_64"
     }
     #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "macos",
         all(target_os = "windows", target_arch = "x86_64")
     )))]
     {
@@ -274,7 +282,7 @@ fn run_exiftool(
     let mut command = Command::new(&tool.executable);
     command.env_clear();
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     {
         command
             .env("LC_ALL", "C.UTF-8")
@@ -332,7 +340,7 @@ fn run_exiftool(
     }
 
     #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
+        target_os = "macos",
         all(target_os = "windows", target_arch = "x86_64")
     )))]
     {
@@ -396,13 +404,13 @@ fn windows_argfile(batch: &[PathBuf]) -> std::io::Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 struct EmbeddedExifTool {
     directory: PathBuf,
     executable: PathBuf,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 impl EmbeddedExifTool {
     fn extract() -> Result<Self, String> {
         let digest = Sha256::digest(EXIFTOOL_PAYLOAD);
@@ -442,7 +450,7 @@ impl EmbeddedExifTool {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 impl Drop for EmbeddedExifTool {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.directory);
@@ -613,7 +621,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 fn private_temp_directory() -> Result<PathBuf, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -640,20 +648,20 @@ fn private_temp_directory() -> Result<PathBuf, String> {
     Err("无法分配唯一的 ExifTool 临时目录。".into())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 fn set_private_directory_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_os = "macos")]
 fn set_private_executable_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(any(
-    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "macos",
     all(target_os = "windows", target_arch = "x86_64")
 )))]
 struct EmbeddedExifTool {
@@ -661,7 +669,7 @@ struct EmbeddedExifTool {
 }
 
 #[cfg(not(any(
-    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "macos",
     all(target_os = "windows", target_arch = "x86_64")
 )))]
 impl EmbeddedExifTool {
@@ -1329,7 +1337,7 @@ mod tests {
         assert!(windows_argfile(&[PathBuf::from("/photos/bad\n-config")]).is_err());
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     #[test]
     fn embedded_exiftool_runs_with_a_cleared_path_and_reports_unsupported_types() {
         let root = std::env::temp_dir().join(format!(
@@ -1352,7 +1360,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "set PAM_EXIFTOOL_TEST_IMAGE to an ExifTool sample image for an integration smoke test"]
     fn embedded_exiftool_reads_real_gps_and_capture_time_tags() {
@@ -1369,7 +1377,7 @@ mod tests {
         assert!(results[0].capture_raw.is_some());
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "set PAM_EXIFTOOL_MOV_TEST_IMAGE to a MOV sample with Keys:GPSCoordinates"]
     fn embedded_exiftool_reads_quicktime_gps_and_creation_date() {

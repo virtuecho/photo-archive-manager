@@ -10,6 +10,14 @@ macOS arm64 构建脚本要求本机 Rust 工具链，并用锁定的 Cargo 依�
 
 输出文件为 `target/aarch64-apple-darwin/release/photo-archive-manager`。它是一个 Mach-O 可执行文件，包含本机 macOS arm64 的 ExifTool 有效载荷；归档功能使用进程内 Rust 7z 引擎。运行程序不需要从 `PATH` 安装或查找 ExifTool、7-Zip、Perl 或 Python。
 
+macOS Intel 可在 macOS 主机上安装 Rust x86_64 target 后构建：
+
+```sh
+./scripts/build-macos-x86_64.sh
+```
+
+已构建 `target/x86_64-apple-darwin/release/photo-archive-manager`，嵌入独立 x86_64 ExifTool/Perl payload；Intel 目标的 ExifTool 释放和启动用例已在 Rosetta 下通过。此构建尚未在 Intel 实机或干净系统完成全流程验收。
+
 Windows x86_64 可在本机安装 Rust GNU target 与 MinGW-w64 后运行：
 
 ```sh
@@ -26,13 +34,13 @@ cargo test --release archive::tests::archives_a_single_file_larger_than_the_defa
 
 ## 发布判定
 
-当前产物仍是开发构建，不是已批准的最终发布包。没有在断网干净系统上完成安装依赖为零的启动和全流程验收，也没有签名/公证；本机 GUI 文件选择器、Dock 和 Gatekeeper 的裸 Mach-O 分发行为尚未确认。Windows 产物只在 macOS 上交叉编译，尚无 Windows 实机运行证据；macOS Intel 没有对应 ExifTool 有效载荷或 Release 构建。
+当前产物仍是开发构建，不是已批准的最终发布包。没有在断网干净系统上完成安装依赖为零的启动和全流程验收，也没有签名/公证；本机 GUI 文件选择器、Dock 和 Gatekeeper 的裸 Mach-O 分发行为尚未确认。Windows 产物只在 macOS 上交叉编译，尚无 Windows 实机运行证据；macOS Intel 交叉构建已完成，但需做 Intel/干净系统全流程验收。
 
-因此，本仓库目前不能宣称达到交接方案要求的 Windows/macOS 单文件、自包含、离线最终交付定义。请在获得目标平台有效载荷、干净系统验收和分发验证前，把 `target/` 产物视为开发文件。
+因此，本仓库目前不能宣称达到交接方案要求的 Windows/macOS 单文件、自包含、离线最终交付定义。macOS Intel 已有 ExifTool payload 和交叉构建产物，但需完成整机/干净系统验收；Windows 也需实机验收。请在获得目标平台干净系统验收和分发验证前，把 `target/` 产物视为开发文件。
 
 ## 已知限制
 
-- ExifTool 已有 macOS arm64 与 Windows x86_64 嵌入构建；Windows 包装路径通过上游哈希、Zip 解包、释放 EXE 哈希和版本文本检查，但没有 Windows 实机验证。macOS Intel 需补齐有效载荷并构建。
+- ExifTool 已有 macOS arm64、macOS x86_64 与 Windows x86_64 payload；Intel payload 在 Rosetta 下已做版本启动检查，完整 Intel 应用和干净机器运行仍待验收。Windows 包装路径通过上游哈希、ZIP 解包、释放 EXE 哈希和版本文本检查，但没有 Windows 实机验证。
 - 重复检查支持 JPEG/PNG/HEIC/HEIF pHash 与并排预览；HEIF 使用内置纯 Rust Heifer 解码器，并限制为 5000 万像素。当前只用编码生成的 HEIC 样本验证，需补真实手机样本验收；没有 RAW 解码或可导出的 Final Manifest。携带阶段⑥结果后，Final Manifest 的路径、SHA-256 和排除决定会保存到本机私有检查点，启动时恢复；备份/归档会重新扫描并复核哈希。检查点不保存密码、GPS 或旧 PASS 状态。
 - 阶段⑤/⑥完整重检、来源重扫、路由/过滤修改、重复制、审核决定或备份映射修改会清除已知依赖结果。应用不实时监视外部文件改动；用户需重新扫描/校验，任务会重新读取文件并核对 SHA-256；阶段⑤复查确认先前异常已有效时会标记 `RESOLVED`。可读的元数据警告可逐项标记 `ACCEPTED`，该标记仅表示用户接受当前状态，不会消除警告，也不等同于 `RESOLVED`。
 - 任务支持当前进程内在安全边界暂停/恢复；关闭程序后可恢复阶段③未完成的分类复制计划、阶段⑦备份映射、阶段⑧归档输入和隔离还原选项，以及阶段⑥审核清单。阶段③会重验已有目标；阶段⑦会重新扫描来源并验证已有目标；阶段⑧要求重新输入密码，并重新扫描、从头重建和验证，不保存旧 PASS。归档先写临时单文件再切卷，峰值临时空间可能接近最终归档体积的两倍；严格还原校验还需要一份输入内容大小的临时空间；中断残留不会自动删除，已有输出不会覆盖。多卷最终提交遇到一般错误会回滚，但系统崩溃时多文件名无法作为一个原子事务提交。

@@ -27,15 +27,15 @@
 | 能力 | 当前结论 | 还需完成 |
 |---|---|---|
 | 原生窗口与文件夹选择 | Rust `eframe` + `rfd` 覆盖 macOS、Windows API；本机 macOS arm64 已实际点选。阶段①—④已通过临时文件夹 GUI 操作验证。 | 干净 Windows、干净 macOS 启动验证；严格单文件启动/分发验证。 |
-| ExifTool | macOS arm64：官方 ExifTool 13.60 用 PAR::Packer 1.064 构建为约 15 MB 的独立 Mach-O，校验 SHA-256 后释放到 0700 私有临时目录，以 argv 批量读取 JSON；`otool -L` 仅显示系统依赖。在 JPEG GPS/拍摄时间、HEIC、MOV、CR2/CR3、NEF、RAF、DNG 和中文空格路径样本上通过。Windows x86_64：嵌入官方 ExifTool 13.60 ZIP（与 SourceForge SHA-256 一致），启动时校验 ZIP/释放 EXE 哈希及版本，释放到 `%LOCALAPPDATA%` 私有目录；使用 UTF-8 参数文件处理中文路径。Windows Release PE 已从本机交叉编译。 | 尚未在 Windows 实机或干净系统运行 ExifTool/GUI；尚无 macOS Intel 有效载荷；macOS 裸 Mach-O Finder/Gatekeeper 验收未完成。 |
+| ExifTool | macOS arm64：ExifTool 13.60 用 PAR::Packer 1.064 构建为独立 Mach-O，校验 SHA-256 后释放到 0700 私有临时目录，以 argv 批量读取 JSON；`otool -L` 仅显示系统依赖。在 JPEG GPS/拍摄时间、HEIC、MOV、CR2/CR3、NEF、RAF、DNG 和中文空格路径样本上通过。macOS x86_64：同版本代码用 x86_64 Perl 5.34.1 / PAR::Packer 1.064 重打包为独立 Intel Mach-O；SHA-256 已固定、`otool -L` 仅显示系统库，并已在 Rosetta 下以清空环境启动返回 13.60；Intel 目标编译的应用测试也在 Rosetta 下成功释放并启动它。Windows x86_64：嵌入官方 ExifTool 13.60 ZIP（与 SourceForge SHA-256 一致），启动时校验 ZIP/释放 EXE 哈希及版本，释放到 `%LOCALAPPDATA%` 私有目录；使用 UTF-8 参数文件处理中文路径。 | macOS Intel 尚需在 Intel 实机/干净系统验收；Windows 实机和干净系统 GUI/ExifTool 验收未完成；macOS 裸 Mach-O Finder/Gatekeeper 验收未完成。 |
 | 加密 7z | GUI、加密头、Store、流式 manifest/SHA-256 校验、可选隔离目录还原重读校验和 `.7z.001/.002/...` 逻辑分卷已实现。官方 7-Zip 26.05 arm64 对应用生成的小卷样本与 2,000,000,001 字节单文件归档均识别为 `Type = Split`，中文密码 `t`、大文件提取和提取后 SHA-256 比对成功。验证工具仅下载到临时目录，没有随程序发布。 | `sevenz-rust2` writer 本身不提供原生多卷；当前先写完整临时归档再切卷，峰值临时空间可能接近最终归档的两倍；严格还原校验还会临时占用一份还原数据大小的空间。程序清理自身密码字符串，但库内部 `Password` 缓冲区不保证主动擦零；跨平台与干净系统验收尚未做。 |
 | HEIC/HEIF 预览解码 | JPEG/PNG 与 HEIC/HEIF 可计算 pHash 并并排预览。HEIF 解码通过内置纯 Rust Heifer 0.3.17，最多 5000 万像素；用编码生成的 HEIC 样本通过测试。 | 需要真实手机/相机 HEIC 与干净系统验收；尚未优先提取内嵌预览，也没有 RAW 解码。失败格式只显示不可计算，不会误报相似。 |
 
 ## 当前构建环境与限制
 
-- 开发主机：macOS arm64；Rust 1.99.1，已安装 `aarch64-apple-darwin` 与 `x86_64-pc-windows-gnu` target，以及 MinGW-w64 14.0.0。`scripts/build-windows-x86_64.sh` 可重建 Windows GUI PE。
+- 开发主机：macOS arm64；Rust 1.99.1，已安装 `aarch64-apple-darwin`、`x86_64-apple-darwin` 与 `x86_64-pc-windows-gnu` target，以及 MinGW-w64 14.0.0。`scripts/build-macos-x86_64.sh` 可交叉构建 macOS Intel GUI；`scripts/build-windows-x86_64.sh` 可重建 Windows GUI PE。
 - 本机可交叉编译 Windows 源码，不等于 Windows 实机或干净系统验收；当前没有干净 Windows/macOS 运行证据。
-- 最新本机 Release 构建为约 23 MB 的 arm64 Mach-O，其中包含约 15 MB 的 ExifTool/Perl 有效载荷；`otool -L` 仅列出 macOS 系统框架与系统库。它尚未作为裸 GUI 文件在干净系统、Finder 或 Gatekeeper 流程中验收。
+- macOS arm64 与 Intel Release 目标均已构建；Intel 产物 `target/x86_64-apple-darwin/release/photo-archive-manager` 为约 23 MB x86_64 Mach-O，并通过 Rosetta 下的嵌入 ExifTool 冒烟用例。两种架构均尚未作为裸 GUI 文件在干净系统、Finder 或 Gatekeeper 流程中验收。
 - macOS `.app` 是目录形式，不能代替严格单物理文件要求。裸 Mach-O GUI 的系统启动、文件选择器与分发行为尚未验证。
 - Windows Release 产物 `target/x86_64-pc-windows-gnu/release/photo-archive-manager.exe` 为约 20 MB PE32+ GUI；PE 导入表只列 Windows 系统 DLL/UCRT API，不含 MinGW 运行时 DLL。尚未用 Windows 实机启动这个交叉构建产物。
 - 阶段②目前是逐扩展名路由，还没有来源级规则、同名冲突重命名或可用空间 dry run。新阶段③复制遇到已存在目标时只报错；恢复任务会重新比较同名目标和源的 SHA-256，一致才继续。
@@ -45,9 +45,9 @@
 - 阶段⑦退出恢复会重新扫描映射来源，并重新执行复制与目标哈希验证；已有且内容一致的目标可通过复核，不一致时不会覆盖。检查点保存的是映射，不保存旧 PASS 或单文件完成状态；系统崩溃后目标目录里的额外文件仍会被报告。
 - 阶段⑧已有产品 UI、分卷加密 Store 校验、退出后输入参数恢复和可选隔离目录还原校验；检查点不包含密码、文件清单或旧 PASS。恢复会从头扫描并重建；被强制结束时产生的临时文件不会自动清理，重跑遇到已有输出会拒绝覆盖。严格还原校验需要额外可容纳一份还原内容的临时空间。
 - 阶段⑥人工排除决定不会物理删除文件；携带后路径、哈希和排除决定保存在权限受限的本机应用数据检查点，启动时恢复。编辑已携带的排除决定会重建清单并更新检查点。备份/归档仍重新扫描并复核内容哈希；检查点不包含密码、GPS、元数据结果或旧 PASS 状态，也不等于通用阶段恢复。
-- macOS arm64 ExifTool 已实际运行；Windows ExifTool 有效载荷已做静态封装/哈希/版本测试并交叉编译，不等于 Windows 实机或干净系统验收。macOS Intel 仍无有效载荷。
-- 本机 `cargo test --locked` 最近一次结果：52 passed、0 failed、3 ignored（两项需要外部 ExifTool 样本、一项需显式运行的 2 GB 压力用例）。覆盖 JPEG/PNG 与生成 HEIC 样本预览、HEIC pHash、元数据复查 RESOLVED 状态、阶段③复制检查点序列化/源时间戳恢复、目标匹配恢复和冲突拒绝、阶段⑦映射检查点往返与相对目标路径拒绝及警告分类、阶段⑧归档输入检查点、审核指纹和隔离还原校验、阶段⑥检查点往返/权限和审核排除清单重建、Windows 官方 ExifTool ZIP 解包校验和 UTF-8 参数文件；压力用例此前已用 Release 配置通过，完整流式处理 2,000,000,001 字节单文件，按十进制 2,000,000,000 字节切卷并通过应用内 SHA-256 验证。
-- `scripts/build-macos-arm64.sh` 最近一次成功；产物 `target/aarch64-apple-darwin/release/photo-archive-manager` 是 macOS arm64 Mach-O，约 23 MB，`otool -L` 仅显示 Apple 系统框架与系统库。Windows 脚本生成了约 21 MB GUI PE，且无 MinGW DLL 依赖。两者均未在干净系统上运行验收；Windows PE 未在 Windows 实机启动。
+- macOS arm64 ExifTool 已在本机样本上运行；macOS Intel 应用已交叉构建，并在 Rosetta 下通过一个嵌入工具运行用例，完整元数据样本和 Intel 实机验收仍待完成；Windows ExifTool 有效载荷已做静态封装/哈希/版本校验并交叉编译，不等于 Windows 实机或干净系统验收。
+- 本机 `cargo test --locked` 最近一次结果：53 passed、0 failed、3 ignored（两项需要外部 ExifTool 样本、一项需显式运行的 2 GB 压力用例）。覆盖 JPEG/PNG 与生成 HEIC 样本预览、HEIC pHash、元数据复查 `RESOLVED`/`ACCEPTED` 状态、阶段③复制检查点序列化/源时间戳恢复、目标匹配恢复和冲突拒绝、阶段⑦映射检查点往返与相对目标路径拒绝及警告分类、阶段⑧归档输入检查点、审核指纹和隔离还原校验、阶段⑥检查点往返/权限和审核排除清单重建、Windows 官方 ExifTool ZIP 解包校验和 UTF-8 参数文件；压力用例此前已用 Release 配置通过，完整流式处理 2,000,000,001 字节单文件，按十进制 2,000,000,000 字节切卷并通过应用内 SHA-256 验证。
+- `scripts/build-macos-arm64.sh` 与 `scripts/build-macos-x86_64.sh` 均已成功；arm64 与 Intel 产物各约 23 MB，`otool -L` 仅显示 Apple 系统框架与系统库。Windows 脚本生成了约 21 MB GUI PE，且无 MinGW DLL 依赖。三种产物均未在干净系统上全流程验收；Windows PE 未在 Windows 实机启动，Intel GUI 仅在 Rosetta 下运行嵌入 ExifTool 冒烟用例。
 - 2026-11-02 使用从 [7-Zip 官方下载页](https://www.7-zip.org/download.html) 获取的 7-Zip 26.05 macOS arm64 验证应用生成的多卷归档：100 字节测试卷被识别为 `Type = Split`、`Volumes = 4` 并通过 `7zz t`；默认大小测试首卷为 2,000,000,000 字节，官方工具识别两卷、`7zz t` 通过并成功提取 2,000,000,001 字节文件。提取文件和同尺寸稀疏输入的 SHA-256 均为 `455f84a8f75731bc92566d751017b278e7ead58533b68f4b7a390c01fef4f1a9`。验证程序位于临时目录，没有捆入产品；测试密码通过终端交互输入。
 - 生成的 `target/` 是开发产物，不是经过签名、公证或干净系统离线验收的发布包；不宣称 Windows 或最终单文件交付已达标。
 
