@@ -268,10 +268,13 @@ struct PhotoArchiveApp {
     copy_planned: usize,
     verify_results: Vec<VerifyItemResult>,
     verify_coverage: Option<VerifyCoverage>,
+    verify_needs_recheck: bool,
     direct_verify_source: Option<PathBuf>,
     direct_verify_target: Option<PathBuf>,
     metadata_directory: Option<PathBuf>,
     metadata_results: Vec<MetadataRecord>,
+    metadata_previous_results: Vec<MetadataRecord>,
+    resolved_metadata_paths: std::collections::BTreeSet<PathBuf>,
     duplicate_directory: Option<PathBuf>,
     duplicate_options: DuplicateOptions,
     duplicate_report: Option<duplicates::DuplicateReport>,
@@ -291,6 +294,7 @@ struct PhotoArchiveApp {
     pending_backup_resume: Option<Vec<BackupMapping>>,
     backup_copies: Vec<CopyItemResult>,
     backup_verification: Vec<VerifyItemResult>,
+    backup_needs_recheck: bool,
     archive_source: Option<PathBuf>,
     archive_output_directory: Option<PathBuf>,
     pending_archive_resume: Option<checkpoint::SavedArchivePlan>,
@@ -829,6 +833,12 @@ impl PhotoArchiveApp {
 
     fn verification_stage(&mut self, ui: &mut eframe::egui::Ui) {
         ui.label("重新读取源文件和目标文件，逐项比较文件大小与 SHA-256。复制时生成的源哈希不会代替目标复读。");
+        if self.verify_needs_recheck {
+            ui.colored_label(
+                eframe::egui::Color32::from_rgb(140, 85, 0),
+                "上游文件已重新扫描或修改；旧完整性结果已失效，请重新验证。",
+            );
+        }
         let valid_pairs = self
             .copy_results
             .iter()
@@ -1008,6 +1018,8 @@ impl PhotoArchiveApp {
                         Ok(path) => {
                             self.metadata_directory = Some(path);
                             self.metadata_results.clear();
+                            self.metadata_previous_results.clear();
+                            self.resolved_metadata_paths.clear();
                         }
                         Err(error) => {
                             self.status = format!("无法读取所选目录 {}：{error}", path.display());
@@ -1065,6 +1077,15 @@ impl PhotoArchiveApp {
                 "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 读取错误 {read_errors}",
                 self.metadata_results.len()
             ));
+            if !self.resolved_metadata_paths.is_empty() {
+                ui.colored_label(
+                    eframe::egui::Color32::DARK_GREEN,
+                    format!(
+                        "RESOLVED：本轮复查确认 {} 项先前异常已转为有效。",
+                        self.resolved_metadata_paths.len()
+                    ),
+                );
+            }
             eframe::egui::ScrollArea::vertical()
                 .id_salt("metadata-results")
                 .max_height(360.0)
@@ -1072,6 +1093,12 @@ impl PhotoArchiveApp {
                     for item in self.metadata_results.iter().take(80) {
                         ui.group(|ui| {
                             ui.label(item.path.display().to_string());
+                            if self.resolved_metadata_paths.contains(&item.path) {
+                                ui.colored_label(
+                                    eframe::egui::Color32::DARK_GREEN,
+                                    "RESOLVED · 本轮复查已转为有效",
+                                );
+                            }
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(format!(
                                     "类型：{}",
@@ -1391,6 +1418,12 @@ impl PhotoArchiveApp {
 
     fn backup_stage(&mut self, ui: &mut eframe::egui::Ui) {
         ui.label("每行将一个本地整理文件夹映射到一个或多个独立备份目标。目标是最终文件夹本身；复制后会重新读取源与每个目标文件并逐项比较 SHA-256。此阶段可单独使用。");
+        if self.backup_needs_recheck {
+            ui.colored_label(
+                eframe::egui::Color32::from_rgb(140, 85, 0),
+                "来源文件、审核清单或备份映射已变化；旧备份结果已失效，请重新扫描并验证。",
+            );
+        }
         if !self.excluded_final_paths.is_empty() {
             ui.weak(format!(
                 "本次会话携带 {} 个阶段⑥排除标记；路径完全匹配的文件将从备份清单排除。",
@@ -2282,9 +2315,8 @@ impl PhotoArchiveApp {
             self.status = "请先选择待检查目录。".into();
             return;
         };
-        self.duplicate_report = None;
-        self.clear_saved_review();
-        self.clear_candidate_preview();
+        self.metadata_previous_results.clear();
+        self.invalidate_file_results_for_rescan();
         self.work_completed = 0;
         self.work_total = 0;
         self.work_bytes = 0;
@@ -2472,7 +2504,9 @@ impl PhotoArchiveApp {
         if self.work_running || !metadata::embedded_tool_available() {
             return;
         }
-        self.metadata_results.clear();
+        self.metadata_previous_results = std::mem::take(&mut self.metadata_results);
+        self.resolved_metadata_paths.clear();
+        self.invalidate_file_results_for_rescan();
         self.work_completed = 0;
         self.work_total = 0;
         self.work_bytes = 0;
@@ -2877,6 +2911,9 @@ impl PhotoArchiveApp {
                     self.work_control = None;
                     self.verify_results = results;
                     self.verify_coverage = coverage;
+                    if !cancelled {
+                        self.verify_needs_recheck = false;
+                    }
                     let matching = self
                         .verify_results
                         .iter()
@@ -2926,6 +2963,14 @@ impl PhotoArchiveApp {
                     self.work_kind = None;
                     self.work_receiver = None;
                     self.work_control = None;
+                    if cancelled {
+                        self.metadata_previous_results.clear();
+                        self.resolved_metadata_paths.clear();
+                    } else {
+                        self.resolved_metadata_paths =
+                            find_resolved_metadata_paths(&self.metadata_previous_results, &results);
+                        self.metadata_previous_results.clear();
+                    }
                     self.metadata_results = results;
                     let passed = self
                         .metadata_results
@@ -2938,7 +2983,10 @@ impl PhotoArchiveApp {
                     let read_errors = self
                         .metadata_results
                         .iter()
-                        .filter(|item| item.gps_status == MetadataStatus::ReadError)
+                        .filter(|item| {
+                            item.gps_status == MetadataStatus::ReadError
+                                || item.time_status == MetadataStatus::ReadError
+                        })
                         .count();
                     let warnings = self
                         .metadata_results
@@ -3043,6 +3091,9 @@ impl PhotoArchiveApp {
                         || verification
                             .iter()
                             .any(|item| !item.result.as_ref().is_ok_and(|result| result.matches));
+                    if !backup_incomplete {
+                        self.backup_needs_recheck = false;
+                    }
                     if !verify_only {
                         if backup_incomplete {
                             self.pending_backup_resume = Some(self.backup_mappings.clone());
@@ -3166,6 +3217,11 @@ impl PhotoArchiveApp {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    if self.work_kind == Some(WorkKind::Metadata) {
+                        self.metadata_results.clear();
+                        self.metadata_previous_results.clear();
+                        self.resolved_metadata_paths.clear();
+                    }
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
@@ -3640,19 +3696,38 @@ impl PhotoArchiveApp {
     }
 
     fn clear_backup_results(&mut self) {
+        self.backup_needs_recheck |= !self.backup_copies.is_empty()
+            || !self.backup_verification.is_empty()
+            || self.pending_backup_resume.is_some();
         self.backup_copies.clear();
         self.backup_verification.clear();
+    }
+
+    fn invalidate_file_results_for_rescan(&mut self) {
+        let had_verify_results = !self.verify_results.is_empty() || self.verify_coverage.is_some();
+        self.clear_verify_results();
+        self.verify_needs_recheck = had_verify_results;
+        self.metadata_results.clear();
+        self.duplicate_report = None;
+        self.resolved_metadata_paths.clear();
+        self.clear_candidate_preview();
+        self.clear_saved_review();
     }
 
     fn clear_verify_results(&mut self) {
         self.verify_results.clear();
         self.verify_coverage = None;
+        self.verify_needs_recheck = false;
         self.status = "校验路径已更改；旧校验结果已清除。".into();
     }
 
     fn invalidate_after_copy_change(&mut self) {
+        let had_verify_results = !self.verify_results.is_empty() || self.verify_coverage.is_some();
         self.clear_verify_results();
+        self.verify_needs_recheck = had_verify_results;
         self.metadata_results.clear();
+        self.metadata_previous_results.clear();
+        self.resolved_metadata_paths.clear();
         self.duplicate_report = None;
         self.clear_candidate_preview();
         self.clear_saved_review();
@@ -3757,15 +3832,19 @@ impl PhotoArchiveApp {
                 self.copy_results.clear();
                 self.verify_results.clear();
                 self.verify_coverage = None;
+                self.verify_needs_recheck = false;
                 self.direct_verify_source = None;
                 self.direct_verify_target = None;
                 self.metadata_directory = None;
                 self.metadata_results.clear();
+                self.metadata_previous_results.clear();
+                self.resolved_metadata_paths.clear();
                 self.duplicate_report = None;
                 self.clear_saved_review();
                 self.backup_mappings.clear();
                 self.backup_copies.clear();
                 self.backup_verification.clear();
+                self.backup_needs_recheck = false;
                 self.status = "未携带来源清单；下一阶段需重新选择输入。".into();
                 self.stage = (self.stage + 1).min(STAGES.len() - 1);
             }
@@ -4148,6 +4227,28 @@ fn is_system_junk(relative_path: &Path) -> bool {
         })
 }
 
+fn find_resolved_metadata_paths(
+    previous: &[MetadataRecord],
+    current: &[MetadataRecord],
+) -> std::collections::BTreeSet<PathBuf> {
+    let current_status = current
+        .iter()
+        .map(|item| (item.path.clone(), (item.gps_status, item.time_status)))
+        .collect::<BTreeMap<_, _>>();
+    previous
+        .iter()
+        .filter(|old| {
+            old.gps_status != MetadataStatus::Valid || old.time_status != MetadataStatus::Valid
+        })
+        .filter(|old| {
+            current_status.get(&old.path).is_some_and(|(gps, time)| {
+                *gps == MetadataStatus::Valid && *time == MetadataStatus::Valid
+            })
+        })
+        .map(|item| item.path.clone())
+        .collect()
+}
+
 fn default_archive_name(source: &Path) -> String {
     let folder = source
         .file_name()
@@ -4383,6 +4484,36 @@ mod tests {
         assert_eq!(manifest.file_sha256.len(), 1);
         assert!(manifest.file_sha256.contains_key(&kept));
         assert!(!manifest.file_sha256.contains_key(&excluded));
+    }
+
+    #[test]
+    fn metadata_recheck_marks_only_prior_warnings_that_are_now_fully_valid() {
+        let fixed = PathBuf::from("/photos/fixed.jpg");
+        let still_missing = PathBuf::from("/photos/still-missing.jpg");
+        let newly_valid = PathBuf::from("/photos/new.jpg");
+        let mut old_fixed = MetadataRecord::unsupported(fixed.clone(), "previous warning");
+        old_fixed.gps_status = MetadataStatus::Missing;
+        old_fixed.time_status = MetadataStatus::Valid;
+        let mut old_missing =
+            MetadataRecord::unsupported(still_missing.clone(), "previous warning");
+        old_missing.gps_status = MetadataStatus::Valid;
+        old_missing.time_status = MetadataStatus::Missing;
+        let previous = vec![old_fixed, old_missing];
+        let mut current_fixed = MetadataRecord::unsupported(fixed.clone(), "");
+        current_fixed.gps_status = MetadataStatus::Valid;
+        current_fixed.time_status = MetadataStatus::Valid;
+        let mut current_missing = MetadataRecord::unsupported(still_missing.clone(), "");
+        current_missing.gps_status = MetadataStatus::Valid;
+        current_missing.time_status = MetadataStatus::Missing;
+        let mut current_new = MetadataRecord::unsupported(newly_valid, "");
+        current_new.gps_status = MetadataStatus::Valid;
+        current_new.time_status = MetadataStatus::Valid;
+        let current = vec![current_fixed, current_missing, current_new];
+
+        assert_eq!(
+            find_resolved_metadata_paths(&previous, &current),
+            std::collections::BTreeSet::from([fixed])
+        );
     }
 
     fn temp_dir() -> PathBuf {
