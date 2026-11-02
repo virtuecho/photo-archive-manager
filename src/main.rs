@@ -676,6 +676,15 @@ impl PhotoArchiveApp {
                 ),
             );
         }
+        if ui
+            .add_enabled(
+                !self.scanning && !self.work_running,
+                eframe::egui::Button::new("完成分类设置并进入下一阶段…"),
+            )
+            .clicked()
+        {
+            self.finish_routing_stage();
+        }
         if routes_changed {
             self.invalidate_copy_plan();
         }
@@ -3804,6 +3813,61 @@ impl PhotoArchiveApp {
         self.verify_coverage = None;
         self.verify_needs_recheck = false;
         self.status = "校验路径已更改；旧校验结果已清除。".into();
+    }
+
+    fn finish_routing_stage(&mut self) {
+        let Some(scan) = self.last_scan.as_ref() else {
+            return;
+        };
+        let required_extensions = scan
+            .files
+            .iter()
+            .filter(|file| !is_system_junk(&file.relative_path))
+            .map(|file| file.extension.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let unmapped = required_extensions
+            .iter()
+            .filter(|extension| {
+                !self
+                    .routes
+                    .iter()
+                    .any(|route| route.extension == **extension && route.destination.is_some())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mappings =
+            self.routes
+                .iter()
+                .filter_map(|route| {
+                    route.destination.as_ref().map(|destination| {
+                        format!("{} → {}", route.extension, destination.display())
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+        let mappings = if mappings.is_empty() {
+            "无".to_string()
+        } else {
+            mappings
+        };
+        let routed_count = self.copy_plan().items.len();
+        self.handoff_title = "文件分类已完成".into();
+        self.handoff_description = format!(
+            "已为 {} 种扩展名中的 {} 种配置目标，当前可路由 {} 个文件。映射：{}。{}下一阶段会预览过滤项、路径重叠和目标冲突；本阶段没有复制文件。",
+            required_extensions.len(),
+            required_extensions.len().saturating_sub(unmapped.len()),
+            routed_count,
+            mappings,
+            if unmapped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "未映射扩展名：{}；相关文件会保留在清单并跳过复制。",
+                    unmapped.join("、")
+                )
+            }
+        );
+        self.show_handoff = true;
     }
 
     fn invalidate_after_copy_change(&mut self) {
