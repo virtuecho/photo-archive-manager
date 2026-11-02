@@ -1,20 +1,46 @@
+use std::{path::PathBuf, process::Command};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::io::Write;
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    test
+))]
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
-    path::{Path, PathBuf},
-    process::Command,
+    path::Path,
 };
 
 use serde_json::Value;
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    test
+))]
 use sha2::{Digest, Sha256};
 
 use crate::task_control::TaskControl;
 
-const EXIFTOOL_SHA256: &str = "224c4384d1df807c14f6ebcb04972ab5b918cac076b9dc4cebc99da981ed0b95";
 const FILES_PER_BATCH: usize = 64;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const EXIFTOOL_SHA256: &str = "224c4384d1df807c14f6ebcb04972ab5b918cac076b9dc4cebc99da981ed0b95";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const EXIFTOOL_WINDOWS_ZIP_SHA256: &str =
+    "548b1f4e0b713cd2a26824b34080c35db4e2d2edd166468eb38b1d55ada90c2e";
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const EXIFTOOL_WINDOWS_EXE_SHA256: &str =
+    "44b336d7596c3ec86577a5ff6d46e8388a56eb69a15f09987d4ac6cc3abbf75e";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const EXIFTOOL_PAYLOAD: &[u8] = include_bytes!("../resources/exiftool/macos-aarch64/exiftool");
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const EXIFTOOL_WINDOWS_PAYLOAD: &[u8] =
+    include_bytes!("../resources/exiftool/windows-x86_64/exiftool-13.60_64.zip");
+#[cfg(all(test, not(all(target_os = "windows", target_arch = "x86_64"))))]
+const EXIFTOOL_WINDOWS_TEST_PAYLOAD: &[u8] =
+    include_bytes!("../resources/exiftool/windows-x86_64/exiftool-13.60_64.zip");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataStatus {
@@ -122,20 +148,36 @@ impl MetadataRecord {
 }
 
 pub fn embedded_tool_available() -> bool {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
     {
         true
     }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
     {
         false
     }
 }
 
 pub fn embedded_tool_version() -> &'static str {
-    if embedded_tool_available() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
         "ExifTool 13.60 · macOS arm64"
-    } else {
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "ExifTool 13.60 · Windows x86_64"
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    {
         "当前平台暂无已验证的内置 ExifTool"
     }
 }
@@ -157,39 +199,7 @@ where
             return Ok((results, true));
         }
 
-        let output = Command::new(&tool.executable)
-            .env_clear()
-            .env("LC_ALL", "C.UTF-8")
-            .env("LANG", "C.UTF-8")
-            .args([
-                "-json",
-                "-n",
-                "-G1",
-                "-s",
-                "-a",
-                "-FileType",
-                "-GPSLatitude",
-                "-GPSLatitudeRef",
-                "-GPSLongitude",
-                "-GPSLongitudeRef",
-                "-GPSCoordinates",
-                "-SubSecDateTimeOriginal",
-                "-DateTimeOriginal",
-                "-OffsetTimeOriginal",
-                "-QuickTime:CreateDate",
-                "-QuickTime:CreationDate",
-                "-QuickTime:GPSCoordinates",
-                "-Make",
-                "-Model",
-                "-LensModel",
-                "-FocalLength",
-                "-ExposureTime",
-                "-ISO",
-                "-GPSAltitude",
-                "--",
-            ])
-            .args(batch)
-            .output();
+        let output = run_exiftool(&tool, batch);
 
         match output {
             Ok(output) => {
@@ -257,6 +267,135 @@ where
     Ok((results, false))
 }
 
+fn run_exiftool(
+    tool: &EmbeddedExifTool,
+    batch: &[PathBuf],
+) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new(&tool.executable);
+    command.env_clear();
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        command
+            .env("LC_ALL", "C.UTF-8")
+            .env("LANG", "C.UTF-8")
+            .args([
+                "-json",
+                "-n",
+                "-G1",
+                "-s",
+                "-a",
+                "-FileType",
+                "-GPSLatitude",
+                "-GPSLatitudeRef",
+                "-GPSLongitude",
+                "-GPSLongitudeRef",
+                "-GPSCoordinates",
+                "-SubSecDateTimeOriginal",
+                "-DateTimeOriginal",
+                "-OffsetTimeOriginal",
+                "-QuickTime:CreateDate",
+                "-QuickTime:CreationDate",
+                "-QuickTime:GPSCoordinates",
+                "-Make",
+                "-Model",
+                "-LensModel",
+                "-FocalLength",
+                "-ExposureTime",
+                "-ISO",
+                "-GPSAltitude",
+                "--",
+            ])
+            .args(batch);
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        let arguments = windows_argfile(batch)?;
+        let argfile = tool.directory.join("arguments.txt");
+        fs::write(&argfile, arguments)?;
+        let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Windows SystemRoot 环境变量不可用",
+            )
+        })?;
+        command
+            .current_dir(&tool.directory)
+            .env("SystemRoot", &system_root)
+            .env("WINDIR", &system_root)
+            .env("TEMP", &tool.directory)
+            .env("TMP", &tool.directory)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .args(["-charset", "filename=utf8", "-@", "arguments.txt"]);
+    }
+
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )))]
+    {
+        let _ = (tool, batch);
+        return Err(std::io::Error::other(
+            "此构建没有对应平台的自包含 ExifTool 有效载荷",
+        ));
+    }
+
+    command.output()
+}
+
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn windows_argfile(batch: &[PathBuf]) -> std::io::Result<String> {
+    const OPTIONS: &[&str] = &[
+        "-json",
+        "-n",
+        "-G1",
+        "-s",
+        "-a",
+        "-FileType",
+        "-GPSLatitude",
+        "-GPSLatitudeRef",
+        "-GPSLongitude",
+        "-GPSLongitudeRef",
+        "-GPSCoordinates",
+        "-SubSecDateTimeOriginal",
+        "-DateTimeOriginal",
+        "-OffsetTimeOriginal",
+        "-QuickTime:CreateDate",
+        "-QuickTime:CreationDate",
+        "-QuickTime:GPSCoordinates",
+        "-Make",
+        "-Model",
+        "-LensModel",
+        "-FocalLength",
+        "-ExposureTime",
+        "-ISO",
+        "-GPSAltitude",
+        "--",
+    ];
+    let mut lines = OPTIONS
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
+    for path in batch {
+        let path = path.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "文件路径不是可表示的 Unicode；请改名后重试",
+            )
+        })?;
+        if path.contains(['\r', '\n']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows ExifTool 参数文件不支持文件名中的换行符；请改名后重试",
+            ));
+        }
+        lines.push(path.to_string());
+    }
+    Ok(lines.join("\n") + "\n")
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct EmbeddedExifTool {
     directory: PathBuf,
@@ -310,6 +449,170 @@ impl Drop for EmbeddedExifTool {
     }
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+struct EmbeddedExifTool {
+    directory: PathBuf,
+    executable: PathBuf,
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+impl EmbeddedExifTool {
+    fn extract() -> Result<Self, String> {
+        let archive_hash = sha256_hex(EXIFTOOL_WINDOWS_PAYLOAD);
+        if archive_hash != EXIFTOOL_WINDOWS_ZIP_SHA256 {
+            return Err(format!(
+                "内置 Windows ExifTool ZIP 校验失败：SHA-256 {archive_hash}"
+            ));
+        }
+
+        let directory = private_windows_directory()?;
+        let executable = directory.join("exiftool.exe");
+        let result = (|| {
+            extract_windows_payload(EXIFTOOL_WINDOWS_PAYLOAD, &directory)?;
+            let executable_bytes = fs::read(&executable)
+                .map_err(|error| format!("无法读取释放后的 ExifTool：{error}"))?;
+            let executable_hash = sha256_hex(&executable_bytes);
+            if executable_hash != EXIFTOOL_WINDOWS_EXE_SHA256 {
+                return Err(format!(
+                    "释放后的 Windows ExifTool SHA-256 不符：{executable_hash}"
+                ));
+            }
+
+            let system_root = std::env::var_os("SystemRoot")
+                .ok_or_else(|| "Windows SystemRoot 环境变量不可用。".to_string())?;
+            let output = Command::new(&executable)
+                .current_dir(&directory)
+                .env_clear()
+                .env("SystemRoot", &system_root)
+                .env("WINDIR", &system_root)
+                .env("TEMP", &directory)
+                .env("TMP", &directory)
+                .arg("-ver")
+                .output()
+                .map_err(|error| format!("无法启动内置 Windows ExifTool：{error}"))?;
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !output.status.success() || version != "13.60" {
+                return Err(format!(
+                    "内置 Windows ExifTool 版本检查失败：退出码 {}，版本输出 {:?}，错误 {}",
+                    output.status,
+                    version,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(error);
+        }
+
+        Ok(Self {
+            directory,
+            executable,
+        })
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+impl Drop for EmbeddedExifTool {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn extract_windows_payload(payload: &[u8], directory: &Path) -> Result<(), String> {
+    use std::io::Cursor;
+
+    const PACKAGE_ROOT: &str = "exiftool-13.60_64";
+    let mut archive = zip::ZipArchive::new(Cursor::new(payload))
+        .map_err(|error| format!("无法读取内置 ExifTool ZIP：{error}"))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("无法读取内置 ExifTool ZIP 项：{error}"))?;
+        let entry_path = entry
+            .enclosed_name()
+            .ok_or_else(|| "内置 ExifTool ZIP 含不安全路径。".to_string())?;
+        let relative = entry_path
+            .strip_prefix(PACKAGE_ROOT)
+            .map_err(|_| "内置 ExifTool ZIP 项不在预期目录内。".to_string())?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let is_executable = relative == Path::new("exiftool(-k).exe");
+        if !is_executable && !relative.starts_with("exiftool_files") {
+            continue;
+        }
+        let destination = if is_executable {
+            directory.join("exiftool.exe")
+        } else {
+            directory.join(relative)
+        };
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)
+                .map_err(|error| format!("无法创建 ExifTool 运行时目录：{error}"))?;
+            continue;
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| "内置 ExifTool ZIP 项缺少父目录。".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建 ExifTool 运行时目录：{error}"))?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|error| format!("无法释放 ExifTool 运行时文件：{error}"))?;
+        let copied = std::io::copy(&mut entry, &mut output)
+            .map_err(|error| format!("释放 ExifTool 运行时文件失败：{error}"))?;
+        if copied != entry.size() {
+            return Err(format!(
+                "内置 ExifTool ZIP 项长度校验失败：{}",
+                destination.display()
+            ));
+        }
+        output
+            .sync_all()
+            .map_err(|error| format!("无法同步 ExifTool 运行时文件：{error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn private_windows_directory() -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    let root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "Windows LOCALAPPDATA 环境变量不可用。".to_string())?
+        .join("PhotoArchiveManager/runtime");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("无法创建 Windows 私有运行时目录：{error}"))?;
+    for _ in 0..8 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            "photo-archive-exiftool-{}-{id}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("无法创建 ExifTool 私有临时目录：{error}")),
+        }
+    }
+    Err("无法分配唯一的 ExifTool 临时目录。".into())
+}
+
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn private_temp_directory() -> Result<PathBuf, String> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -349,10 +652,18 @@ fn set_private_executable_permissions(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-struct EmbeddedExifTool;
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
+struct EmbeddedExifTool {
+    executable: PathBuf,
+}
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
 impl EmbeddedExifTool {
     fn extract() -> Result<Self, String> {
         Err("此构建没有对应平台的自包含 ExifTool 有效载荷。".into())
@@ -981,6 +1292,41 @@ mod tests {
             capture_epoch_millis(&timed("2018-02-21T12:08:56", false)),
             None
         );
+    }
+
+    #[test]
+    fn verified_windows_exiftool_payload_extracts_with_expected_version() {
+        const ARCHIVE_HASH: &str =
+            "548b1f4e0b713cd2a26824b34080c35db4e2d2edd166468eb38b1d55ada90c2e";
+        const EXE_HASH: &str = "44b336d7596c3ec86577a5ff6d46e8388a56eb69a15f09987d4ac6cc3abbf75e";
+        assert_eq!(sha256_hex(EXIFTOOL_WINDOWS_TEST_PAYLOAD), ARCHIVE_HASH);
+
+        let root = std::env::temp_dir().join(format!(
+            "photo-archive-windows-payload-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        extract_windows_payload(EXIFTOOL_WINDOWS_TEST_PAYLOAD, &root).unwrap();
+
+        let executable = std::fs::read(root.join("exiftool.exe")).unwrap();
+        assert_eq!(sha256_hex(&executable), EXE_HASH);
+        let script = std::fs::read_to_string(root.join("exiftool_files/exiftool.pl")).unwrap();
+        assert!(script.contains("my $version = '13.60';"));
+        assert!(
+            root.join("exiftool_files/Licenses_Strawberry_Perl.zip")
+                .is_file()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_exiftool_argfile_preserves_unicode_paths_and_rejects_newlines() {
+        let path = PathBuf::from("/photos/旅行 2026/IMG 上海.jpg");
+        let arguments = windows_argfile(std::slice::from_ref(&path)).unwrap();
+        assert!(arguments.starts_with("-json\n"));
+        assert!(arguments.ends_with("/photos/旅行 2026/IMG 上海.jpg\n"));
+        assert!(windows_argfile(&[PathBuf::from("/photos/bad\n-config")]).is_err());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

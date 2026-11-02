@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -36,6 +38,8 @@ const STAGES: [&str; 8] = [
 
 const LICENSE_NOTICES: &str = include_str!("../resources/THIRD_PARTY_NOTICES.md");
 const EXIFTOOL_LICENSE: &str = include_str!("../resources/exiftool/Artistic-License-1.0.pod");
+const EXIFTOOL_WINDOWS_LICENSES: &str =
+    include_str!("../resources/exiftool/windows-x86_64/THIRD_PARTY_LICENSES.md");
 const RUST_DEPENDENCY_LICENSES: &str = include_str!("../resources/licenses/RUST_DEPENDENCIES.md");
 
 #[derive(Clone, Debug)]
@@ -3149,6 +3153,7 @@ impl PhotoArchiveApp {
                 let choices = [
                     "第三方声明",
                     "ExifTool · Artistic License 1.0",
+                    "Windows ExifTool / Perl 许可文本",
                     "Rust 依赖完整许可清单",
                 ];
                 eframe::egui::ComboBox::from_label("查看文本")
@@ -3160,7 +3165,8 @@ impl PhotoArchiveApp {
                     });
                 let text = match self.license_choice {
                     1 => EXIFTOOL_LICENSE,
-                    2 => RUST_DEPENDENCY_LICENSES,
+                    2 => EXIFTOOL_WINDOWS_LICENSES,
+                    3 => RUST_DEPENDENCY_LICENSES,
                     _ => LICENSE_NOTICES,
                 };
                 eframe::egui::ScrollArea::vertical()

@@ -1,6 +1,6 @@
 # Third-party software and licenses
 
-- ExifTool 13.60 is included for macOS arm64. Its standalone payload and source details are listed in [`exiftool/THIRD_PARTY_NOTICES.md`](exiftool/THIRD_PARTY_NOTICES.md); the bundled copy uses the Artistic License 1.0 option. The license text is in [`exiftool/Artistic-License-1.0.pod`](exiftool/Artistic-License-1.0.pod).
+- ExifTool 13.60 is included for macOS arm64 and Windows x86_64. The macOS standalone payload is documented in [`exiftool/THIRD_PARTY_NOTICES.md`](exiftool/THIRD_PARTY_NOTICES.md) and uses the Artistic License 1.0 option. The official Windows package includes ExifTool, Strawberry Perl, its DLL dependencies, and package licenses; its SHA-256 and upstream source are documented in the same notice. The application license viewer includes the Windows package's license texts in [`exiftool/windows-x86_64/THIRD_PARTY_LICENSES.md`](exiftool/windows-x86_64/THIRD_PARTY_LICENSES.md).
 - `sevenz-rust2` 0.24.2 creates and reads encrypted Store 7z archives. It is licensed under Apache-2.0. The application has not bundled the official 7-Zip executable.
 - `zeroize` 1.9.1 clears application-owned password strings after archive tasks. It is licensed under MIT OR Apache-2.0.
 
