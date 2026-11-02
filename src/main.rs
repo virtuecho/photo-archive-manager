@@ -3941,6 +3941,7 @@ impl PhotoArchiveApp {
 
     fn handoff_dialog(&mut self, ctx: &eframe::egui::Context) {
         let mut action = None;
+        let last_stage = self.stage + 1 == STAGES.len();
         eframe::egui::Window::new(&self.handoff_title)
             .collapsible(false)
             .resizable(false)
@@ -3948,15 +3949,24 @@ impl PhotoArchiveApp {
             .show(ctx, |ui| {
                 ui.label(&self.handoff_description);
                 ui.add_space(8.0);
+                let carry_label = if last_stage {
+                    "保留归档结果并返回阶段①"
+                } else {
+                    "携带本阶段信息并进入下一阶段"
+                };
+                let discard_label = if last_stage {
+                    "不携带本次结果并返回阶段①"
+                } else {
+                    "不携带信息并进入下一阶段"
+                };
                 let carry_button = eframe::egui::Button::new(
-                    eframe::egui::RichText::new("携带本阶段信息并进入下一阶段")
-                        .color(eframe::egui::Color32::WHITE),
+                    eframe::egui::RichText::new(carry_label).color(eframe::egui::Color32::WHITE),
                 )
                 .fill(eframe::egui::Color32::from_rgb(32, 105, 174));
                 if ui.add(carry_button).clicked() {
                     action = Some(0);
                 }
-                if ui.button("不携带信息并进入下一阶段").clicked() {
+                if ui.button(discard_label).clicked() {
                     action = Some(1);
                 }
                 if ui.button("停留在本阶段").clicked() {
@@ -3973,7 +3983,13 @@ impl PhotoArchiveApp {
                 if self.stage == 5 {
                     self.refresh_carried_review();
                 }
-                self.stage = (self.stage + 1).min(STAGES.len() - 1);
+                if last_stage {
+                    self.status =
+                        "归档结果已保留；流程返回阶段①，可重新扫描或在阶段⑧查看归档结果。".into();
+                    self.stage = 0;
+                } else {
+                    self.stage += 1;
+                }
             }
             Some(1) => {
                 self.show_handoff = false;
@@ -3996,8 +4012,21 @@ impl PhotoArchiveApp {
                 self.backup_copies.clear();
                 self.backup_verification.clear();
                 self.backup_needs_recheck = false;
-                self.status = "未携带来源清单；下一阶段需重新选择输入。".into();
-                self.stage = (self.stage + 1).min(STAGES.len() - 1);
+                if last_stage {
+                    self.archive_source = None;
+                    self.archive_output_directory = None;
+                    self.archive_name.clear();
+                    self.archive_name_custom = false;
+                    self.archive_password.zeroize();
+                    self.archive_confirmation.zeroize();
+                    self.archive_show_password = false;
+                    self.status =
+                        "本次归档结果未携带；已生成的归档文件保留在磁盘上。流程返回阶段①。".into();
+                    self.stage = 0;
+                } else {
+                    self.status = "未携带来源清单；下一阶段需重新选择输入。".into();
+                    self.stage += 1;
+                }
             }
             Some(2) => self.show_handoff = false,
             _ => {}
