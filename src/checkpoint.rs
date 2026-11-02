@@ -31,6 +31,16 @@ pub struct SavedBackupMapping {
     pub targets: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SavedArchivePlan {
+    pub source: PathBuf,
+    pub output_directory: PathBuf,
+    pub name: String,
+    pub volume_mb: u32,
+    #[serde(default)]
+    pub manifest_fingerprint: Option<String>,
+}
+
 #[derive(Deserialize, Serialize)]
 struct PendingCopyCheckpoint {
     version: u8,
@@ -41,6 +51,92 @@ struct PendingCopyCheckpoint {
 struct PendingBackupCheckpoint {
     version: u8,
     mappings: Vec<SavedBackupMapping>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PendingArchiveCheckpoint {
+    version: u8,
+    plan: SavedArchivePlan,
+}
+
+pub fn save_pending_archive(plan: &SavedArchivePlan) -> io::Result<()> {
+    write_pending_archive_to(&pending_archive_path()?, plan)
+}
+
+fn write_pending_archive_to(path: &Path, plan: &SavedArchivePlan) -> io::Result<()> {
+    validate_pending_archive(plan)?;
+    write_json_atomically(
+        path,
+        &PendingArchiveCheckpoint {
+            version: 1,
+            plan: plan.clone(),
+        },
+    )
+}
+
+pub fn load_pending_archive() -> io::Result<Option<SavedArchivePlan>> {
+    read_pending_archive_from(&pending_archive_path()?)
+}
+
+fn read_pending_archive_from(path: &Path) -> io::Result<Option<SavedArchivePlan>> {
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)?;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "归档任务检查点必须是普通文件",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let data = fs::read(path)?;
+    let checkpoint: PendingArchiveCheckpoint =
+        serde_json::from_slice(&data).map_err(io::Error::other)?;
+    if checkpoint.version != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "不支持的归档任务检查点版本",
+        ));
+    }
+    validate_pending_archive(&checkpoint.plan)?;
+    Ok(Some(checkpoint.plan))
+}
+
+fn validate_pending_archive(plan: &SavedArchivePlan) -> io::Result<()> {
+    if !plan.source.is_absolute()
+        || !plan.output_directory.is_absolute()
+        || plan.name.trim().is_empty()
+        || !(1..=2_000).contains(&plan.volume_mb)
+        || plan
+            .manifest_fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| {
+                fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "归档任务来源、输出目录、名称或分卷大小无效",
+        ));
+    }
+    Ok(())
+}
+
+pub fn clear_pending_archive() -> io::Result<()> {
+    match fs::remove_file(pending_archive_path()?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn save_pending_backup(mappings: &[SavedBackupMapping]) -> io::Result<()> {
@@ -259,6 +355,10 @@ fn pending_copy_path() -> io::Result<PathBuf> {
 
 fn pending_backup_path() -> io::Result<PathBuf> {
     Ok(checkpoint_dir()?.join("unfinished-backup.json"))
+}
+
+fn pending_archive_path() -> io::Result<PathBuf> {
+    Ok(checkpoint_dir()?.join("unfinished-archive.json"))
 }
 
 fn checkpoint_dir() -> io::Result<PathBuf> {
@@ -533,6 +633,16 @@ mod tests {
         }
     }
 
+    fn sample_archive_plan(root: &Path) -> SavedArchivePlan {
+        SavedArchivePlan {
+            source: root.join("photos"),
+            output_directory: root.join("archives"),
+            name: "Photos 2026_11_02".into(),
+            volume_mb: 2_000,
+            manifest_fingerprint: None,
+        }
+    }
+
     #[test]
     fn checkpoint_round_trips_review_and_exclusions() {
         let dir = temp_path();
@@ -627,6 +737,47 @@ mod tests {
             write_pending_backup_to(&path, &[mapping])
                 .unwrap_err()
                 .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_archive_checkpoint_round_trips_without_credentials() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-archive.json");
+        let plan = sample_archive_plan(&dir);
+        write_pending_archive_to(&path, &plan).unwrap();
+        assert_eq!(read_pending_archive_from(&path).unwrap(), Some(plan));
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.to_ascii_lowercase().contains("password"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_archive_checkpoint_rejects_invalid_volume_size() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-archive.json");
+        let mut plan = sample_archive_plan(&dir);
+        plan.volume_mb = 0;
+        assert_eq!(
+            write_pending_archive_to(&path, &plan).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_archive_checkpoint_rejects_invalid_manifest_fingerprint() {
+        let dir = temp_path();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unfinished-archive.json");
+        let mut plan = sample_archive_plan(&dir);
+        plan.manifest_fingerprint = Some("not-a-sha256".into());
+        assert_eq!(
+            write_pending_archive_to(&path, &plan).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
         fs::remove_dir_all(dir).unwrap();

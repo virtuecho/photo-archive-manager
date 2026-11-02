@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -288,6 +289,7 @@ struct PhotoArchiveApp {
     backup_verification: Vec<VerifyItemResult>,
     archive_source: Option<PathBuf>,
     archive_output_directory: Option<PathBuf>,
+    pending_archive_resume: Option<checkpoint::SavedArchivePlan>,
     archive_name: String,
     archive_name_custom: bool,
     archive_password: String,
@@ -1696,6 +1698,7 @@ impl PhotoArchiveApp {
     }
 
     fn archive_stage(&mut self, ui: &mut eframe::egui::Ui) {
+        let mut archive_inputs_changed = false;
         ui.label("选择一个本地文件夹，生成内部含同名顶层目录的加密 7z Store 归档；完成后逐项核对归档清单并流式重算 SHA-256。");
         ui.colored_label(
             eframe::egui::Color32::from_rgb(40, 105, 40),
@@ -1713,6 +1716,7 @@ impl PhotoArchiveApp {
                 match fs::canonicalize(&path) {
                     Ok(path) => {
                         let default_name = default_archive_name(&path);
+                        archive_inputs_changed |= self.archive_source.as_ref() != Some(&path);
                         self.archive_source = Some(path);
                         if !self.archive_name_custom {
                             self.archive_name = default_name;
@@ -1738,7 +1742,11 @@ impl PhotoArchiveApp {
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
             {
                 match fs::canonicalize(&path) {
-                    Ok(path) => self.archive_output_directory = Some(path),
+                    Ok(path) => {
+                        archive_inputs_changed |=
+                            self.archive_output_directory.as_ref() != Some(&path);
+                        self.archive_output_directory = Some(path);
+                    }
                     Err(error) => {
                         self.status = format!("无法读取归档输出目录 {}：{error}", path.display());
                     }
@@ -1759,14 +1767,20 @@ impl PhotoArchiveApp {
                 .changed()
             {
                 self.archive_name_custom = true;
+                archive_inputs_changed = true;
             }
             ui.label("（自动补 .7z）");
         });
-        ui.add_enabled(
-            !self.work_running,
-            eframe::egui::Slider::new(&mut self.archive_options.volume_mb, 1..=2000)
-                .text("单卷上限（十进制 MB）"),
-        );
+        archive_inputs_changed |= ui
+            .add_enabled(
+                !self.work_running,
+                eframe::egui::Slider::new(&mut self.archive_options.volume_mb, 1..=2000)
+                    .text("单卷上限（十进制 MB）"),
+            )
+            .changed();
+        if archive_inputs_changed {
+            self.invalidate_pending_archive();
+        }
         ui.weak("2000 MB = 2,000,000,000 字节。密码只用于当前归档任务；不会写入文件名、进程参数或报告。归档采用 Store（不压缩）、AES-256 和加密文件名。");
         if !self.excluded_final_paths.is_empty() {
             ui.weak(format!(
@@ -1831,7 +1845,26 @@ impl PhotoArchiveApp {
             && !self.archive_password.is_empty()
             && self.archive_password == self.archive_confirmation;
         ui.horizontal(|ui| {
-            if ui
+            if self.pending_archive_resume.is_some() {
+                if ui
+                    .add_enabled(
+                        !self.work_running && ready,
+                        eframe::egui::Button::new("重新扫描并重建归档"),
+                    )
+                    .clicked()
+                {
+                    self.start_archive();
+                }
+                if ui
+                    .add_enabled(
+                        !self.work_running,
+                        eframe::egui::Button::new("丢弃恢复记录"),
+                    )
+                    .clicked()
+                {
+                    self.discard_pending_archive();
+                }
+            } else if ui
                 .add_enabled(
                     !self.work_running && ready,
                     eframe::egui::Button::new("创建并验证加密归档"),
@@ -1848,6 +1881,9 @@ impl PhotoArchiveApp {
                 control.cancel();
             }
         });
+        if self.pending_archive_resume.is_some() {
+            ui.weak("检测到未完成归档。恢复会重新扫描并从头创建、验证；密码未保存，请重新输入。中断留下的临时文件不会自动删除；若目标归档已存在，程序不会覆盖，请更换名称或先处理残留文件。");
+        }
         if !self.archive_password.is_empty()
             && !self.archive_confirmation.is_empty()
             && self.archive_password != self.archive_confirmation
@@ -1875,6 +1911,19 @@ impl PhotoArchiveApp {
             return;
         }
         let name = self.archive_name.trim().to_string();
+        let plan = checkpoint::SavedArchivePlan {
+            source: source.clone(),
+            output_directory: output_directory.clone(),
+            name: name.clone(),
+            volume_mb: self.archive_options.volume_mb,
+            manifest_fingerprint: self.archive_manifest_fingerprint(&source),
+        };
+        let was_resume = self.pending_archive_resume.is_some();
+        if let Err(error) = checkpoint::save_pending_archive(&plan) {
+            self.status = format!("无法保存归档恢复检查点，未开始归档：{error}");
+            return;
+        }
+        self.pending_archive_resume = Some(plan);
         let max_bytes = u64::from(self.archive_options.volume_mb) * 1_000_000;
         let excluded_paths = self.excluded_final_paths.clone();
         let included_sha256 = self
@@ -1890,7 +1939,11 @@ impl PhotoArchiveApp {
         self.work_bytes = 0;
         self.work_kind = Some(WorkKind::Archive);
         self.work_running = true;
-        self.status = "正在扫描、建立哈希清单并创建临时加密归档…".into();
+        self.status = if was_resume {
+            "正在重新扫描来源并从头重建、验证加密归档…".into()
+        } else {
+            "正在扫描、建立哈希清单并创建临时加密归档…".into()
+        };
         let (sender, receiver) = mpsc::channel();
         let control = TaskControl::default();
         let worker_control = control.clone();
@@ -3040,17 +3093,25 @@ impl PhotoArchiveApp {
                     self.work_control = None;
                     match result {
                         Ok(result) => {
+                            let recovery_warning = match checkpoint::clear_pending_archive() {
+                                Ok(()) => {
+                                    self.pending_archive_resume = None;
+                                    String::new()
+                                }
+                                Err(error) => format!("归档完成，但无法清理恢复记录：{error}。"),
+                            };
                             self.status = format!(
-                                "归档完成并通过逐文件 SHA-256 还原流校验：{} 个文件，{} 卷，输入 {}，归档 {}。{}",
+                                "归档完成并通过逐文件 SHA-256 还原流校验：{} 个文件，{} 卷，输入 {}，归档 {}。{}{}",
                                 result.file_count,
                                 result.volume_count,
                                 format_bytes(result.total_bytes),
                                 format_bytes(result.archive_bytes),
-                                result.cleanup_warning.as_deref().unwrap_or("")
+                                result.cleanup_warning.as_deref().unwrap_or(""),
+                                recovery_warning
                             );
                             self.handoff_title = "加密归档已完成".into();
                             self.handoff_description = format!(
-                                "已在临时目录完成归档清单和逐文件 SHA-256 读取校验，并防覆盖提交卷集：{}。验证文件 {} 项；输入 {}；总归档大小 {}。这套卷对应一个逻辑 7z 归档。{}",
+                                "已在临时目录完成归档清单和逐文件 SHA-256 读取校验，并防覆盖提交卷集：{}。验证文件 {} 项；输入 {}；总归档大小 {}。这套卷对应一个逻辑 7z 归档。{}{}",
                                 result
                                     .volume_paths
                                     .iter()
@@ -3060,7 +3121,8 @@ impl PhotoArchiveApp {
                                 result.file_count,
                                 format_bytes(result.total_bytes),
                                 format_bytes(result.archive_bytes),
-                                result.cleanup_warning.as_deref().unwrap_or("")
+                                result.cleanup_warning.as_deref().unwrap_or(""),
+                                recovery_warning
                             );
                             self.show_handoff = !self.apply_pending_stage();
                         }
@@ -3375,6 +3437,85 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn restore_pending_archive(&mut self) {
+        match checkpoint::load_pending_archive() {
+            Ok(Some(plan)) => {
+                self.archive_source = Some(plan.source.clone());
+                self.archive_output_directory = Some(plan.output_directory.clone());
+                self.archive_name = plan.name.clone();
+                self.archive_name_custom = true;
+                self.archive_options.volume_mb = plan.volume_mb;
+                if plan.manifest_fingerprint == self.archive_manifest_fingerprint(&plan.source) {
+                    self.pending_archive_resume = Some(plan);
+                    if self.pending_copy_resume.is_none() && self.pending_backup_resume.is_none() {
+                        self.stage = 7;
+                        self.status =
+                            "发现上次未完成的加密归档。阶段⑧可重新扫描来源并从头重建；请重新输入密码。"
+                                .into();
+                    } else {
+                        self.status =
+                            "另有未完成的加密归档恢复记录；阶段⑧可重新扫描并从头重建，密码需重新输入。"
+                                .into();
+                    }
+                } else {
+                    self.pending_archive_resume = None;
+                    let cleanup_warning = checkpoint::clear_pending_archive()
+                        .err()
+                        .map(|error| format!("无法清除旧检查点：{error}。"))
+                        .unwrap_or_default();
+                    self.status = format!(
+                        "已恢复归档输入，但阶段⑥审核范围与中断前不同或不可用；旧恢复记录已作废。请核对当前审核清单后重新开始。{cleanup_warning}"
+                    );
+                }
+            }
+            Ok(None) => self.pending_archive_resume = None,
+            Err(error) => {
+                self.status = format!("无法读取上次加密归档检查点：{error}。现有文件未被修改。");
+            }
+        }
+    }
+
+    fn archive_manifest_fingerprint(&self, source: &Path) -> Option<String> {
+        let manifest = self
+            .final_manifest
+            .as_ref()
+            .filter(|manifest| manifest.applies_to(source))?;
+        let data = serde_json::to_vec(&(
+            &manifest.root,
+            &manifest.file_sha256,
+            &self.excluded_final_paths,
+        ))
+        .ok()?;
+        let mut fingerprint = String::with_capacity(64);
+        for byte in Sha256::digest(data) {
+            use std::fmt::Write;
+            write!(fingerprint, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        Some(fingerprint)
+    }
+
+    fn discard_pending_archive(&mut self) {
+        self.pending_archive_resume = None;
+        match checkpoint::clear_pending_archive() {
+            Ok(()) => {
+                self.status = "已丢弃加密归档恢复记录；可能存在的临时文件和已有归档未删除。".into()
+            }
+            Err(error) => {
+                self.status = format!("无法删除加密归档检查点：{error}；现有文件未修改。")
+            }
+        }
+    }
+
+    fn invalidate_pending_archive(&mut self) {
+        if self.pending_archive_resume.take().is_some()
+            && let Err(error) = checkpoint::clear_pending_archive()
+        {
+            self.status = format!(
+                "归档输入已更改，但无法清除旧恢复检查点：{error}。重新开始时会尝试覆盖检查点。"
+            );
+        }
+    }
+
     fn resume_pending_backup(&mut self) {
         let Some(mappings) = self.pending_backup_resume.take() else {
             return;
@@ -3412,6 +3553,7 @@ impl PhotoArchiveApp {
     }
 
     fn persist_saved_review(&mut self) {
+        self.invalidate_pending_archive();
         self.clear_backup_results();
         let Some(manifest) = &self.final_manifest else {
             self.clear_saved_review();
@@ -3441,6 +3583,10 @@ impl PhotoArchiveApp {
         self.pending_backup_resume = None;
         if let Err(error) = checkpoint::clear_pending_backup() {
             self.status = format!("无法清除过期备份检查点：{error}");
+        }
+        self.pending_archive_resume = None;
+        if let Err(error) = checkpoint::clear_pending_archive() {
+            self.status = format!("无法清除过期归档检查点：{error}");
         }
         if let Err(error) = checkpoint::clear() {
             self.status = format!("无法清除本机阶段⑥恢复检查点：{error}");
@@ -4174,6 +4320,7 @@ fn main() -> eframe::Result {
             app.restore_saved_review();
             app.restore_pending_copy();
             app.restore_pending_backup();
+            app.restore_pending_archive();
             Ok(Box::new(app))
         }),
     )
