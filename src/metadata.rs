@@ -3,11 +3,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::task_control::TaskControl;
 
 const EXIFTOOL_SHA256: &str = "224c4384d1df807c14f6ebcb04972ab5b918cac076b9dc4cebc99da981ed0b95";
 const FILES_PER_BATCH: usize = 64;
@@ -141,7 +142,7 @@ pub fn embedded_tool_version() -> &'static str {
 
 pub fn inspect_files<F>(
     paths: &[PathBuf],
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut progress: F,
 ) -> Result<(Vec<MetadataRecord>, bool), String>
 where
@@ -152,7 +153,7 @@ where
     let total = paths.len();
 
     for batch in paths.chunks(FILES_PER_BATCH) {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return Ok((results, true));
         }
 
@@ -995,7 +996,7 @@ mod tests {
         fs::write(&file, "not an image or video\n").unwrap();
 
         let (results, cancelled) =
-            inspect_files(&[file.clone()], &AtomicBool::new(false), |_, _| {}).unwrap();
+            inspect_files(&[file.clone()], &TaskControl::default(), |_, _| {}).unwrap();
 
         assert!(!cancelled);
         assert_eq!(results.len(), 1);
@@ -1011,7 +1012,7 @@ mod tests {
     fn embedded_exiftool_reads_real_gps_and_capture_time_tags() {
         let path = PathBuf::from(std::env::var_os("PAM_EXIFTOOL_TEST_IMAGE").unwrap());
         let (results, cancelled) =
-            inspect_files(&[path], &AtomicBool::new(false), |_, _| {}).unwrap();
+            inspect_files(&[path], &TaskControl::default(), |_, _| {}).unwrap();
         assert!(!cancelled);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_type.as_deref(), Some("JPEG"));
@@ -1028,7 +1029,7 @@ mod tests {
     fn embedded_exiftool_reads_quicktime_gps_and_creation_date() {
         let path = PathBuf::from(std::env::var_os("PAM_EXIFTOOL_MOV_TEST_IMAGE").unwrap());
         let (results, cancelled) =
-            inspect_files(&[path], &AtomicBool::new(false), |_, _| {}).unwrap();
+            inspect_files(&[path], &TaskControl::default(), |_, _| {}).unwrap();
         assert!(!cancelled);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_type.as_deref(), Some("MOV"));

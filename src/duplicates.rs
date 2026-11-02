@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 use image::{DynamicImage, ImageDecoder, ImageReader, imageops::FilterType};
@@ -9,6 +8,7 @@ use image::{DynamicImage, ImageDecoder, ImageReader, imageops::FilterType};
 use crate::{
     files,
     metadata::{MetadataRecord, MetadataStatus, capture_epoch_millis},
+    task_control::TaskControl,
 };
 
 const MAX_TIME_CANDIDATES: usize = 100_000;
@@ -51,7 +51,7 @@ struct HashedFile<'a> {
 pub fn analyze<F>(
     metadata: &[MetadataRecord],
     threshold_seconds: u32,
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut progress: F,
 ) -> (DuplicateReport, bool)
 where
@@ -62,7 +62,7 @@ where
     let mut by_hash = BTreeMap::<String, Vec<PathBuf>>::new();
 
     for (index, record) in metadata.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return (report, true);
         }
         match files::sha256_file(&record.path) {
@@ -114,11 +114,14 @@ where
     let tolerance = i64::from(threshold_seconds).saturating_mul(1000);
     let mut phashes = HashMap::<PathBuf, Result<u64, String>>::new();
     for first_index in 0..timed.len() {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return (report, true);
         }
         let (first_time, first) = timed[first_index];
-        for (second_time, second) in timed.iter().skip(first_index + 1) {
+        for (pair_index, (second_time, second)) in timed.iter().skip(first_index + 1).enumerate() {
+            if pair_index % 1024 == 0 && !control.checkpoint() {
+                return (report, true);
+            }
             let delta_millis = second_time.saturating_sub(first_time);
             if delta_millis > tolerance {
                 break;
@@ -292,7 +295,7 @@ mod tests {
     use image::{GrayImage, Luma};
     use std::{
         fs,
-        sync::atomic::{AtomicBool, AtomicU64},
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     fn metadata_record(path: PathBuf, capture: Option<(&str, bool)>) -> MetadataRecord {
@@ -370,7 +373,7 @@ mod tests {
             metadata_record(second.clone(), None),
         ];
 
-        let (report, cancelled) = analyze(&metadata, 5, &AtomicBool::new(false), |_, _| {});
+        let (report, cancelled) = analyze(&metadata, 5, &TaskControl::default(), |_, _| {});
 
         assert!(!cancelled);
         assert_eq!(report.exact_groups.len(), 1);
@@ -393,7 +396,7 @@ mod tests {
             metadata_record(paths[2].clone(), Some(("2024-01-01T00:00:08Z", true))),
         ];
 
-        let (report, cancelled) = analyze(&metadata, 5, &AtomicBool::new(false), |_, _| {});
+        let (report, cancelled) = analyze(&metadata, 5, &TaskControl::default(), |_, _| {});
 
         assert!(!cancelled);
         assert_eq!(report.time_candidates.len(), 2);
@@ -428,7 +431,7 @@ mod tests {
             metadata_record(paths[2].clone(), Some(("2024-01-01T00:00:02", false))),
         ];
 
-        let (report, _) = analyze(&metadata, 5, &AtomicBool::new(false), |_, _| {});
+        let (report, _) = analyze(&metadata, 5, &TaskControl::default(), |_, _| {});
 
         assert_eq!(report.time_candidates.len(), 1);
         assert_eq!(report.time_candidates[0].delta_millis, 5_000);

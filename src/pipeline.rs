@@ -1,9 +1,9 @@
-use std::{
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::path::PathBuf;
 
-use crate::files::{self, CopyReceipt, FileStamp, VerifyResult};
+use crate::{
+    files::{self, CopyReceipt, FileStamp, VerifyResult},
+    task_control::TaskControl,
+};
 
 #[derive(Clone, Debug)]
 pub struct RoutedFile {
@@ -29,7 +29,7 @@ pub struct VerifyItemResult {
 
 pub fn copy_batch(
     items: Vec<RoutedFile>,
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut progress: impl FnMut(usize, usize, u64),
 ) -> (Vec<CopyItemResult>, bool) {
     let total = items.len();
@@ -39,7 +39,8 @@ pub fn copy_batch(
     let mut cancelled = false;
 
     for item in items {
-        if cancel.load(Ordering::Relaxed) {
+        // ponytail: copy pauses between files; mid-file pause needs resumable partial-file state.
+        if !control.checkpoint() {
             cancelled = true;
             break;
         }
@@ -67,14 +68,14 @@ pub fn copy_batch(
 
 pub fn verify_batch(
     pairs: Vec<(PathBuf, PathBuf)>,
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut progress: impl FnMut(usize, usize),
 ) -> (Vec<VerifyItemResult>, bool) {
     let total = pairs.len();
     let mut results = Vec::with_capacity(total);
     let mut cancelled = false;
     for (index, (source, destination)) in pairs.into_iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             cancelled = true;
             break;
         }

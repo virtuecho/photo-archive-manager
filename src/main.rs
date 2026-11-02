@@ -2,11 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, TryRecvError},
-    },
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::SystemTime,
 };
@@ -16,11 +12,13 @@ mod duplicates;
 pub mod files;
 mod metadata;
 mod pipeline;
+mod task_control;
 
 use crate::{
     files::FileStamp,
     metadata::{MetadataRecord, MetadataStatus},
     pipeline::{CopyItemResult, RoutedFile, VerifyItemResult},
+    task_control::TaskControl,
 };
 use zeroize::Zeroize;
 
@@ -234,7 +232,7 @@ struct PhotoArchiveApp {
     roots: Vec<SourceRoot>,
     selected_root: Option<usize>,
     scan_receiver: Option<Receiver<ScanMessage>>,
-    cancel_scan: Option<Arc<AtomicBool>>,
+    cancel_scan: Option<TaskControl>,
     scanning: bool,
     scan_progress: ScanProgress,
     last_scan: Option<ScanSummary>,
@@ -274,7 +272,7 @@ struct PhotoArchiveApp {
     archive_show_password: bool,
     archive_options: ArchiveOptions,
     work_receiver: Option<Receiver<WorkMessage>>,
-    work_cancel: Option<Arc<AtomicBool>>,
+    work_control: Option<TaskControl>,
     work_kind: Option<WorkKind>,
     work_running: bool,
     work_completed: usize,
@@ -687,8 +685,8 @@ impl PhotoArchiveApp {
                 && self.work_kind == Some(WorkKind::Copy)
                 && ui.button("取消（完成当前文件后停止）").clicked()
             {
-                if let Some(cancel) = &self.work_cancel {
-                    cancel.store(true, Ordering::Relaxed);
+                if let Some(control) = &self.work_control {
+                    control.cancel();
                 }
             }
         });
@@ -775,8 +773,8 @@ impl PhotoArchiveApp {
         }
         if self.work_running && self.work_kind == Some(WorkKind::Verify) {
             if ui.button("取消校验").clicked() {
-                if let Some(cancel) = &self.work_cancel {
-                    cancel.store(true, Ordering::Relaxed);
+                if let Some(control) = &self.work_control {
+                    control.cancel();
                 }
             }
         }
@@ -903,8 +901,8 @@ impl PhotoArchiveApp {
                 && self.work_kind == Some(WorkKind::Metadata)
                 && ui.button("取消元数据检查").clicked()
             {
-                if let Some(cancel) = &self.work_cancel {
-                    cancel.store(true, Ordering::Relaxed);
+                if let Some(control) = &self.work_control {
+                    control.cancel();
                 }
             }
         });
@@ -1064,9 +1062,9 @@ impl PhotoArchiveApp {
             if self.work_running
                 && self.work_kind == Some(WorkKind::Duplicates)
                 && ui.button("取消重复检查").clicked()
-                && let Some(cancel) = &self.work_cancel
+                && let Some(control) = &self.work_control
             {
-                cancel.store(true, Ordering::Relaxed);
+                control.cancel();
             }
         });
         if let Some(path) = &self.duplicate_directory {
@@ -1346,9 +1344,9 @@ impl PhotoArchiveApp {
             if self.work_running
                 && self.work_kind == Some(WorkKind::Backup)
                 && ui.button("取消备份").clicked()
-                && let Some(cancel) = &self.work_cancel
+                && let Some(control) = &self.work_control
             {
-                cancel.store(true, Ordering::Relaxed);
+                control.cancel();
             }
         });
         if !self.status.is_empty() {
@@ -1557,9 +1555,9 @@ impl PhotoArchiveApp {
             if self.work_running
                 && self.work_kind == Some(WorkKind::Archive)
                 && ui.button("取消归档").clicked()
-                && let Some(cancel) = &self.work_cancel
+                && let Some(control) = &self.work_control
             {
-                cancel.store(true, Ordering::Relaxed);
+                control.cancel();
             }
         });
         if !self.archive_password.is_empty()
@@ -1606,10 +1604,10 @@ impl PhotoArchiveApp {
         self.work_running = true;
         self.status = "正在扫描、建立哈希清单并创建临时加密归档…".into();
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
             let result = archive::create_and_verify(
                 &source,
@@ -1619,7 +1617,7 @@ impl PhotoArchiveApp {
                 max_bytes,
                 &excluded_paths,
                 included_sha256.as_ref(),
-                &worker_cancel,
+                &worker_control,
                 |completed, total, bytes| {
                     let _ = sender.send(WorkMessage::ArchiveProgress {
                         completed,
@@ -1631,7 +1629,7 @@ impl PhotoArchiveApp {
             password.zeroize();
             let _ = sender.send(WorkMessage::ArchiveComplete {
                 result,
-                cancelled: worker_cancel.load(Ordering::Relaxed),
+                cancelled: worker_control.is_cancelled(),
             });
         });
     }
@@ -1663,10 +1661,10 @@ impl PhotoArchiveApp {
         let excluded = self.excluded_final_paths.clone();
         let final_manifest = self.final_manifest.clone();
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
             let mut items = Vec::<RoutedFile>::new();
             let mut expected_by_target =
@@ -1675,7 +1673,7 @@ impl PhotoArchiveApp {
             let mut excluded_count = 0usize;
             let mut manifest_filtered_count = 0usize;
             for mapping in mappings {
-                if worker_cancel.load(Ordering::Relaxed) {
+                if worker_control.is_cancelled() {
                     let _ = sender.send(WorkMessage::BackupComplete {
                         copies: Vec::new(),
                         verification: Vec::new(),
@@ -1692,7 +1690,7 @@ impl PhotoArchiveApp {
                     .as_ref()
                     .filter(|manifest| manifest.applies_to(&source));
                 let summary =
-                    match scan_sources(std::slice::from_ref(&source), &worker_cancel, |_| {}) {
+                    match scan_sources(std::slice::from_ref(&source), &worker_control, |_| {}) {
                         Ok(summary) => summary,
                         Err(_) => {
                             let _ = sender.send(WorkMessage::BackupComplete {
@@ -1739,6 +1737,16 @@ impl PhotoArchiveApp {
                     }
                 }
                 for file in summary.files {
+                    if !worker_control.checkpoint() {
+                        let _ = sender.send(WorkMessage::BackupComplete {
+                            copies: Vec::new(),
+                            verification: Vec::new(),
+                            cancelled: true,
+                            error,
+                            verify_only,
+                        });
+                        return;
+                    }
                     let expected_sha256 =
                         scoped_manifest.and_then(|manifest| manifest.sha256_for(&file.path));
                     if scoped_manifest.is_some() && expected_sha256.is_none() {
@@ -1807,7 +1815,7 @@ impl PhotoArchiveApp {
                     .map(|item| (item.source, item.destination))
                     .collect::<Vec<_>>();
                 let (mut verification, cancelled) =
-                    pipeline::verify_batch(pairs, &worker_cancel, |completed, total| {
+                    pipeline::verify_batch(pairs, &worker_control, |completed, total| {
                         let _ = sender.send(WorkMessage::BackupProgress {
                             completed,
                             total,
@@ -1827,7 +1835,7 @@ impl PhotoArchiveApp {
                 }
                 let mut verification = verification;
                 let (extra_results, target_error) =
-                    inspect_backup_targets(&expected_by_target, &worker_cancel);
+                    inspect_backup_targets(&expected_by_target, &worker_control);
                 verification.extend(extra_results);
                 if let Some(target_error) = target_error {
                     error = Some(match error {
@@ -1845,7 +1853,7 @@ impl PhotoArchiveApp {
                 return;
             }
             let (copies, cancelled_copy) =
-                pipeline::copy_batch(items, &worker_cancel, |completed, total, bytes| {
+                pipeline::copy_batch(items, &worker_control, |completed, total, bytes| {
                     let _ = sender.send(WorkMessage::BackupProgress {
                         completed,
                         total: total.saturating_mul(2),
@@ -1859,7 +1867,7 @@ impl PhotoArchiveApp {
                 .collect::<Vec<_>>();
             let verify_total = item_count.saturating_mul(2);
             let (verification, cancelled_verify) =
-                pipeline::verify_batch(pairs, &worker_cancel, |completed, _| {
+                pipeline::verify_batch(pairs, &worker_control, |completed, _| {
                     let _ = sender.send(WorkMessage::BackupProgress {
                         completed: item_count.saturating_add(completed),
                         total: verify_total,
@@ -1868,7 +1876,7 @@ impl PhotoArchiveApp {
                 });
             let mut verification = verification;
             let (extra_results, target_error) =
-                inspect_backup_targets(&expected_by_target, &worker_cancel);
+                inspect_backup_targets(&expected_by_target, &worker_control);
             verification.extend(extra_results);
             if let Some(target_error) = target_error {
                 error = Some(match error {
@@ -1906,12 +1914,12 @@ impl PhotoArchiveApp {
         self.status = "正在重新扫描目录并读取拍摄元数据…".into();
         let threshold = self.duplicate_options.time_threshold_seconds;
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
-            let summary = match scan_sources(&[root], &worker_cancel, |progress| {
+            let summary = match scan_sources(&[root], &worker_control, |progress| {
                 let _ = sender.send(WorkMessage::DuplicateProgress {
                     completed: progress.files,
                     total: progress.files,
@@ -1927,7 +1935,7 @@ impl PhotoArchiveApp {
                     return;
                 }
             };
-            if worker_cancel.load(Ordering::Relaxed) {
+            if worker_control.is_cancelled() {
                 let _ = sender.send(WorkMessage::DuplicateComplete {
                     report: duplicates::DuplicateReport::default(),
                     cancelled: true,
@@ -1947,7 +1955,7 @@ impl PhotoArchiveApp {
                 total: paths.len(),
             });
             let metadata =
-                match metadata::inspect_files(&paths, &worker_cancel, |completed, total| {
+                match metadata::inspect_files(&paths, &worker_control, |completed, total| {
                     let _ = sender.send(WorkMessage::DuplicateProgress { completed, total });
                 }) {
                     Ok((records, cancelled)) => {
@@ -1976,7 +1984,7 @@ impl PhotoArchiveApp {
                     }
                 };
             let (report, cancelled) =
-                duplicates::analyze(&metadata, threshold, &worker_cancel, |completed, total| {
+                duplicates::analyze(&metadata, threshold, &worker_control, |completed, total| {
                     let _ = sender.send(WorkMessage::DuplicateProgress { completed, total });
                 });
             let _ = sender.send(WorkMessage::DuplicateComplete {
@@ -2093,15 +2101,15 @@ impl PhotoArchiveApp {
         self.work_running = true;
         self.status = "正在准备 ExifTool 元数据检查…".into();
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
             let (paths, mut scan_error) = match input {
                 MetadataInput::Files(paths) => (paths, None),
                 MetadataInput::Directory(root) => {
-                    let scan = scan_sources(&[root], &worker_cancel, |progress| {
+                    let scan = scan_sources(&[root], &worker_control, |progress| {
                         let _ = sender.send(WorkMessage::MetadataProgress {
                             completed: 0,
                             total: progress.files,
@@ -2142,7 +2150,7 @@ impl PhotoArchiveApp {
                 completed: 0,
                 total,
             });
-            let inspected = metadata::inspect_files(&paths, &worker_cancel, |completed, total| {
+            let inspected = metadata::inspect_files(&paths, &worker_control, |completed, total| {
                 let _ = sender.send(WorkMessage::MetadataProgress { completed, total });
             });
             let (results, cancelled) = match inspected {
@@ -2235,13 +2243,13 @@ impl PhotoArchiveApp {
         self.work_running = true;
         self.status = format!("正在安全复制 {} 个文件…", items.len());
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
             let (results, cancelled) =
-                pipeline::copy_batch(items, &worker_cancel, |completed, total, bytes| {
+                pipeline::copy_batch(items, &worker_control, |completed, total, bytes| {
                     if completed % 32 == 0 || completed == total {
                         let _ = sender.send(WorkMessage::CopyProgress {
                             completed,
@@ -2277,13 +2285,13 @@ impl PhotoArchiveApp {
         self.work_running = true;
         self.status = format!("正在重新读取并校验 {} 对文件…", pairs.len());
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
             let (results, cancelled) =
-                pipeline::verify_batch(pairs, &worker_cancel, |completed, total| {
+                pipeline::verify_batch(pairs, &worker_control, |completed, total| {
                     if completed % 32 == 0 || completed == total {
                         let _ = sender.send(WorkMessage::VerifyProgress { completed, total });
                     }
@@ -2320,13 +2328,13 @@ impl PhotoArchiveApp {
         self.work_running = true;
         self.status = "正在独立扫描并核对源目录与目标目录…".into();
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.work_receiver = Some(receiver);
-        self.work_cancel = Some(cancel);
+        self.work_control = Some(control);
         thread::spawn(move || {
-            let source = scan_sources(&[source_root.clone()], &worker_cancel, |_| {});
-            let target = scan_sources(&[target_root.clone()], &worker_cancel, |_| {});
+            let source = scan_sources(&[source_root.clone()], &worker_control, |_| {});
+            let target = scan_sources(&[target_root.clone()], &worker_control, |_| {});
             let (Ok(source), Ok(target)) = (source, target) else {
                 let _ = sender.send(WorkMessage::VerifyComplete {
                     results: Vec::new(),
@@ -2371,7 +2379,7 @@ impl PhotoArchiveApp {
                 scan_errors: source.error_count + target.error_count,
             };
             let (results, cancelled) =
-                pipeline::verify_batch(pairs, &worker_cancel, |completed, total| {
+                pipeline::verify_batch(pairs, &worker_control, |completed, total| {
                     if completed % 32 == 0 || completed == total {
                         let _ = sender.send(WorkMessage::VerifyProgress { completed, total });
                     }
@@ -2403,7 +2411,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     for result in results {
                         if let Some(existing) = self.copy_results.iter_mut().find(|existing| {
                             existing.source == result.source
@@ -2452,7 +2460,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     self.verify_results = results;
                     self.verify_coverage = coverage;
                     let matching = self
@@ -2503,7 +2511,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     self.metadata_results = results;
                     let passed = self
                         .metadata_results
@@ -2568,7 +2576,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     let exact_groups = report.exact_groups.len();
                     let candidates = report.time_candidates.len();
                     let hash_errors = report.hash_errors.len();
@@ -2614,7 +2622,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     let copied = copies.iter().filter(|item| item.result.is_ok()).count();
                     let copy_failed = copies.len().saturating_sub(copied);
                     let verified = verification
@@ -2667,7 +2675,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     match result {
                         Ok(result) => {
                             self.status = format!(
@@ -2710,7 +2718,7 @@ impl PhotoArchiveApp {
                     self.work_running = false;
                     self.work_kind = None;
                     self.work_receiver = None;
-                    self.work_cancel = None;
+                    self.work_control = None;
                     self.status = "后台处理意外结束；请检查结果并重新运行。".into();
                     break;
                 }
@@ -2754,13 +2762,32 @@ impl PhotoArchiveApp {
         ui.horizontal(|ui| {
             if self.scanning {
                 ui.spinner();
-                ui.label(format!(
-                    "阶段任务：已发现 {} 个文件 / {}",
-                    self.scan_progress.files,
-                    format_bytes(self.scan_progress.bytes)
-                ));
+                let paused = self
+                    .cancel_scan
+                    .as_ref()
+                    .is_some_and(TaskControl::is_paused);
+                ui.label(if paused {
+                    format!(
+                        "阶段任务：扫描暂停中 · 已发现 {} 个文件 / {}",
+                        self.scan_progress.files,
+                        format_bytes(self.scan_progress.bytes)
+                    )
+                } else {
+                    format!(
+                        "阶段任务：已发现 {} 个文件 / {}",
+                        self.scan_progress.files,
+                        format_bytes(self.scan_progress.bytes)
+                    )
+                });
             } else if self.work_running {
                 ui.spinner();
+                if self
+                    .work_control
+                    .as_ref()
+                    .is_some_and(TaskControl::is_paused)
+                {
+                    ui.label("任务暂停中（在安全处理边界生效）。");
+                }
                 let operation = match self.work_kind {
                     Some(WorkKind::Copy) => format!(
                         "复制 {} / {} 项，已写入 {}",
@@ -2801,6 +2828,22 @@ impl PhotoArchiveApp {
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
+                    if (self.scanning || self.work_running)
+                        && let Some(control) =
+                            self.cancel_scan.as_ref().or(self.work_control.as_ref())
+                    {
+                        let paused = control.is_paused();
+                        if ui
+                            .button(if paused {
+                                "恢复任务"
+                            } else {
+                                "暂停任务"
+                            })
+                            .clicked()
+                        {
+                            control.set_paused(!paused);
+                        }
+                    }
                     if ui.button("下一阶段 →").clicked() {
                         self.request_stage((self.stage + 1).min(STAGES.len() - 1));
                     }
@@ -2808,14 +2851,14 @@ impl PhotoArchiveApp {
                         self.request_stage(self.stage.saturating_sub(1));
                     }
                     if self.scanning && ui.button("取消扫描").clicked() {
-                        if let Some(cancel) = &self.cancel_scan {
-                            cancel.store(true, Ordering::Relaxed);
+                        if let Some(control) = &self.cancel_scan {
+                            control.cancel();
                             self.status = "正在取消扫描…".into();
                         }
                     }
                     if self.work_running && ui.button("取消当前任务").clicked() {
-                        if let Some(cancel) = &self.work_cancel {
-                            cancel.store(true, Ordering::Relaxed);
+                        if let Some(control) = &self.work_control {
+                            control.cancel();
                         }
                     }
                 },
@@ -2829,8 +2872,23 @@ impl PhotoArchiveApp {
         } else if self.scanning {
             ui.add(
                 eframe::egui::ProgressBar::new(0.0)
-                    .animate(true)
-                    .text("正在枚举文件"),
+                    .animate(
+                        !self
+                            .cancel_scan
+                            .as_ref()
+                            .is_some_and(TaskControl::is_paused),
+                    )
+                    .text(
+                        if self
+                            .cancel_scan
+                            .as_ref()
+                            .is_some_and(TaskControl::is_paused)
+                        {
+                            "扫描暂停中"
+                        } else {
+                            "正在枚举文件"
+                        },
+                    ),
             );
         }
         let _ = ctx;
@@ -2839,17 +2897,17 @@ impl PhotoArchiveApp {
     fn start_scan(&mut self) {
         let roots: Vec<PathBuf> = self.roots.iter().map(|root| root.path.clone()).collect();
         let (sender, receiver) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
+        let control = TaskControl::default();
+        let worker_control = control.clone();
         self.scan_receiver = Some(receiver);
-        self.cancel_scan = Some(cancel);
+        self.cancel_scan = Some(control);
         self.scanning = true;
         self.final_manifest = None;
         self.scan_progress = ScanProgress::default();
         self.last_scan = None;
         self.status = "正在读取目录清单…".into();
         thread::spawn(move || {
-            let summary = scan_sources(&roots, &worker_cancel, |progress| {
+            let summary = scan_sources(&roots, &worker_control, |progress| {
                 let _ = sender.send(ScanMessage::Progress(progress));
             });
             match summary {
@@ -3089,11 +3147,11 @@ impl PhotoArchiveApp {
             }
             Some(true) => {
                 self.show_switch_prompt = false;
-                if let Some(cancel) = &self.cancel_scan {
-                    cancel.store(true, Ordering::Relaxed);
+                if let Some(control) = &self.cancel_scan {
+                    control.cancel();
                 }
-                if let Some(cancel) = &self.work_cancel {
-                    cancel.store(true, Ordering::Relaxed);
+                if let Some(control) = &self.work_control {
+                    control.cancel();
                 }
                 self.status = "已请求安全停止；当前文件完成后切换阶段。".into();
             }
@@ -3201,15 +3259,15 @@ fn append_task_error(error: &mut Option<String>, message: impl Into<String>) {
 
 fn inspect_backup_targets(
     expected_by_target: &BTreeMap<PathBuf, (PathBuf, std::collections::BTreeSet<PathBuf>)>,
-    cancel: &AtomicBool,
+    control: &TaskControl,
 ) -> (Vec<VerifyItemResult>, Option<String>) {
     let mut results = Vec::new();
     let mut warnings = Vec::new();
     for (target, (source, expected_relative_paths)) in expected_by_target {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             break;
         }
-        match scan_sources(std::slice::from_ref(target), cancel, |_| {}) {
+        match scan_sources(std::slice::from_ref(target), control, |_| {}) {
             Ok(summary) => {
                 if summary.error_count > 0 {
                     warnings.push(format!(
@@ -3241,7 +3299,7 @@ fn inspect_backup_targets(
                     }
                 }
             }
-            Err(_) if cancel.load(Ordering::Relaxed) => break,
+            Err(_) if control.is_cancelled() => break,
             Err(_) => {
                 warnings.push(format!("无法完成目标扫描：{}", target.display()));
                 results.push(VerifyItemResult {
@@ -3258,7 +3316,7 @@ fn inspect_backup_targets(
 
 fn scan_sources(
     roots: &[PathBuf],
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut report: impl FnMut(ScanProgress),
 ) -> Result<ScanSummary, ScanProgress> {
     let mut summary = ScanSummary::default();
@@ -3266,7 +3324,7 @@ fn scan_sources(
     for (source_id, root) in roots.iter().enumerate() {
         let mut pending = vec![root.clone()];
         while let Some(directory) = pending.pop() {
-            if cancel.load(Ordering::Relaxed) {
+            if !control.checkpoint() {
                 return Err(progress);
             }
             progress.directories += 1;
@@ -3278,7 +3336,7 @@ fn scan_sources(
                 }
             };
             for entry in entries {
-                if cancel.load(Ordering::Relaxed) {
+                if !control.checkpoint() {
                     return Err(progress);
                 }
                 let entry = match entry {
@@ -3538,7 +3596,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("nested"), root.join("nested-link")).unwrap();
 
-        let summary = scan_sources(&[root.clone()], &AtomicBool::new(false), |_| {}).unwrap();
+        let summary = scan_sources(&[root.clone()], &TaskControl::default(), |_| {}).unwrap();
 
         assert_eq!(summary.files.len(), 3);
         assert_eq!(summary.bytes, 6);
@@ -3570,9 +3628,10 @@ mod tests {
     fn scanner_can_be_cancelled_without_a_partial_manifest() {
         let root = temp_dir();
         fs::write(root.join("one.jpg"), b"1").unwrap();
-        let cancel = AtomicBool::new(true);
+        let control = TaskControl::default();
+        control.cancel();
 
-        assert!(scan_sources(&[root.clone()], &cancel, |_| {}).is_err());
+        assert!(scan_sources(&[root.clone()], &control, |_| {}).is_err());
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -3638,7 +3697,7 @@ mod tests {
         fs::create_dir_all(&target_one).unwrap();
         fs::create_dir_all(&target_two).unwrap();
         fs::write(source.join("IMG-中文.JPG"), b"photo bytes").unwrap();
-        let summary = scan_sources(&[source.clone()], &AtomicBool::new(false), |_| {}).unwrap();
+        let summary = scan_sources(&[source.clone()], &TaskControl::default(), |_| {}).unwrap();
         let items = summary
             .files
             .iter()
@@ -3657,7 +3716,7 @@ mod tests {
             })
             .collect();
         let (copies, cancelled) =
-            pipeline::copy_batch(items, &AtomicBool::new(false), |_, _, _| {});
+            pipeline::copy_batch(items, &TaskControl::default(), |_, _, _| {});
         assert!(!cancelled);
         assert_eq!(copies.len(), 2);
         assert!(copies.iter().all(|item| item.result.is_ok()));
@@ -3666,7 +3725,7 @@ mod tests {
             .map(|item| (item.source.clone(), item.destination.clone()))
             .collect();
         let (verification, cancelled) =
-            pipeline::verify_batch(pairs, &AtomicBool::new(false), |_, _| {});
+            pipeline::verify_batch(pairs, &TaskControl::default(), |_, _| {});
         assert!(!cancelled);
         assert_eq!(verification.len(), 2);
         assert!(
@@ -3696,7 +3755,7 @@ mod tests {
             ),
         )]);
 
-        let (results, warning) = inspect_backup_targets(&expected, &AtomicBool::new(false));
+        let (results, warning) = inspect_backup_targets(&expected, &TaskControl::default());
 
         assert!(warning.is_none());
         assert_eq!(results.len(), 1);

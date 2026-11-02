@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     time::SystemTime,
 };
 
@@ -13,7 +13,7 @@ use sevenz_rust2::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{files, scan_sources};
+use crate::{files, scan_sources, task_control::TaskControl};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
@@ -168,7 +168,7 @@ pub fn create_and_verify(
     max_bytes: u64,
     excluded_paths: &BTreeSet<PathBuf>,
     included_sha256: Option<&BTreeMap<PathBuf, String>>,
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut progress: impl FnMut(usize, usize, u64),
 ) -> Result<ArchiveResult, String> {
     let source = fs::canonicalize(source)
@@ -232,7 +232,7 @@ pub fn create_and_verify(
         ));
     }
 
-    let summary = scan_sources(&[source.clone()], cancel, |_| {})
+    let summary = scan_sources(&[source.clone()], control, |_| {})
         .map_err(|_| "归档扫描已取消，未创建归档。".to_string())?;
     if summary.error_count > 0 {
         return Err(format!(
@@ -309,7 +309,7 @@ pub fn create_and_verify(
     );
     let mut processed_bytes = 0u64;
     for (index, file) in files.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return Err("归档已取消，未创建归档。".into());
         }
         let name = archive_entry_name(top_name, file.relative)?;
@@ -358,7 +358,7 @@ pub fn create_and_verify(
         );
     }
 
-    for directory in archive_directory_names(&source, top_name, cancel)? {
+    for directory in archive_directory_names(&source, top_name, control)? {
         expected.entry(directory).or_insert(ExpectedEntry {
             directory: true,
             size: 0,
@@ -399,7 +399,7 @@ pub fn create_and_verify(
     }
     processed_bytes = 0;
     for (index, file) in files.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return Err("归档已取消，临时输出已清理。".into());
         }
         let name = archive_entry_name(top_name, file.relative)?;
@@ -443,7 +443,7 @@ pub fn create_and_verify(
         .and_then(|file| file.sync_all())
         .map_err(|error| format!("无法同步临时归档：{error}"))?;
 
-    let final_scan = scan_sources(&[source.clone()], cancel, |_| {})
+    let final_scan = scan_sources(&[source.clone()], control, |_| {})
         .map_err(|_| "归档过程中来源发生变化或扫描被取消；临时归档已清理。".to_string())?;
     let final_files = final_scan
         .files
@@ -468,7 +468,7 @@ pub fn create_and_verify(
         &partial,
         max_bytes,
         &mut cleanup,
-        cancel,
+        control,
         |split_bytes, total_split_bytes| {
             let file_units = files.len();
             let split_units = if total_split_bytes == 0 {
@@ -499,9 +499,10 @@ pub fn create_and_verify(
         password,
         &expected,
         files.len(),
+        control,
         &mut progress,
     )?;
-    if cancel.load(Ordering::Relaxed) {
+    if !control.checkpoint() {
         return Err("归档验证期间已取消；临时归档已清理。".into());
     }
     let final_paths = if staged_volumes.len() == 1 {
@@ -579,17 +580,20 @@ fn archive_entry_name(top_name: &str, relative: &Path) -> Result<String, String>
 fn archive_directory_names(
     root: &Path,
     top_name: &str,
-    cancel: &AtomicBool,
+    control: &TaskControl,
 ) -> Result<BTreeSet<String>, String> {
     let mut names = BTreeSet::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return Err("归档目录扫描已取消。".into());
         }
         let entries = fs::read_dir(&directory)
             .map_err(|error| format!("无法扫描目录 {}：{error}", directory.display()))?;
         for entry in entries {
+            if !control.checkpoint() {
+                return Err("归档目录扫描已取消。".into());
+            }
             let entry = entry.map_err(|error| {
                 format!("无法读取目录 {} 中的项目：{error}", directory.display())
             })?;
@@ -626,7 +630,7 @@ fn split_archive_file(
     archive: &Path,
     max_bytes: u64,
     cleanup: &mut RemoveOnDrop,
-    cancel: &AtomicBool,
+    control: &TaskControl,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Vec<PathBuf>, String> {
     let total = fs::metadata(archive)
@@ -645,7 +649,7 @@ fn split_archive_file(
     let mut next_progress = (max_bytes / 100).max(BUFFER_SIZE as u64);
     let mut buffer = vec![0u8; BUFFER_SIZE.min(max_bytes as usize).max(1)];
     for index in 1..=volume_count {
-        if cancel.load(Ordering::Relaxed) {
+        if !control.checkpoint() {
             return Err("归档分卷已取消；临时卷已清理。".into());
         }
         let path = volume_path(archive, index, true);
@@ -660,7 +664,7 @@ fn split_archive_file(
         let mut in_volume = 0u64;
         let volume_limit = (total - copied).min(max_bytes);
         while in_volume < volume_limit {
-            if cancel.load(Ordering::Relaxed) {
+            if !control.checkpoint() {
                 return Err("归档分卷已取消；临时卷已清理。".into());
             }
             let wanted = (volume_limit - in_volume).min(buffer.len() as u64) as usize;
@@ -697,11 +701,12 @@ fn verify_archive_volumes(
     password: &str,
     expected: &BTreeMap<String, ExpectedEntry>,
     file_count: usize,
+    control: &TaskControl,
     progress: &mut impl FnMut(usize, usize, u64),
 ) -> Result<(), String> {
     let source =
         VolumeReader::open(paths).map_err(|error| format!("无法打开完整归档卷序列：{error}"))?;
-    verify_archive_reader(source, password, expected, file_count, progress)
+    verify_archive_reader(source, password, expected, file_count, control, progress)
 }
 
 fn verify_archive_reader<R: Read + Seek>(
@@ -709,6 +714,7 @@ fn verify_archive_reader<R: Read + Seek>(
     password: &str,
     expected: &BTreeMap<String, ExpectedEntry>,
     file_count: usize,
+    control: &TaskControl,
     progress: &mut impl FnMut(usize, usize, u64),
 ) -> Result<(), String> {
     let password = Password::from(password);
@@ -720,6 +726,13 @@ fn verify_archive_reader<R: Read + Seek>(
     let mut verified_bytes = 0u64;
     reader
         .for_each_entries(|entry, input| {
+            if !control.checkpoint() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "archive verification cancelled",
+                )
+                .into());
+            }
             let name = entry.name().to_string();
             if !seen.insert(name.clone()) {
                 verification_errors.push(format!("归档内存在重复路径：{name}"));
@@ -743,6 +756,13 @@ fn verify_archive_reader<R: Read + Seek>(
             let mut buffer = [0u8; BUFFER_SIZE];
             let mut bytes = 0u64;
             loop {
+                if !control.checkpoint() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "archive verification cancelled",
+                    )
+                    .into());
+                }
                 let count = input.read(&mut buffer)?;
                 if count == 0 {
                     break;
@@ -805,10 +825,7 @@ fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        sync::atomic::{AtomicBool, AtomicU64},
-    };
+    use std::{fs, sync::atomic::AtomicU64};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -866,7 +883,7 @@ mod tests {
             2_000_000_000,
             &BTreeSet::new(),
             None,
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap();
@@ -905,7 +922,7 @@ mod tests {
             2_000_000_000,
             &BTreeSet::new(),
             None,
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap_err();
@@ -919,7 +936,7 @@ mod tests {
             2_000_000_000,
             &BTreeSet::new(),
             None,
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap_err();
@@ -947,7 +964,7 @@ mod tests {
             2_000_000_000,
             &excluded,
             None,
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap();
@@ -980,7 +997,7 @@ mod tests {
             2_000_000_000,
             &BTreeSet::new(),
             Some(&final_manifest),
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap();
@@ -995,7 +1012,7 @@ mod tests {
             2_000_000_000,
             &BTreeSet::new(),
             Some(&final_manifest),
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap_err();
@@ -1010,7 +1027,7 @@ mod tests {
             2_000_000_000,
             &BTreeSet::new(),
             Some(&final_manifest),
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap_err();
@@ -1035,7 +1052,7 @@ mod tests {
             100,
             &BTreeSet::new(),
             None,
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap();
@@ -1087,7 +1104,7 @@ mod tests {
             VOLUME_BYTES,
             &BTreeSet::new(),
             None,
-            &AtomicBool::new(false),
+            &TaskControl::default(),
             |_, _, _| {},
         )
         .unwrap();
