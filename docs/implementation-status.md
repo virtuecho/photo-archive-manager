@@ -11,6 +11,8 @@
 - 阶段②按扩展名显示路由行，可为每种扩展名选最终文件夹，多种扩展名可合并到同一目录，也可添加自定义扩展名规则；未映射类型会显式保留并提示。
 - 阶段③按默认清单过滤 `.DS_Store`、`._*`、`.Spotlight-V100`、`.Trashes`、`.fseventsd`、`Thumbs.db`、`desktop.ini`；界面可恢复包含。会预览未映射、目标已存在、目标重叠和重复路径；后台逐文件复制，目标存在时不覆盖，可重试未通过/未开始项。
 - 阶段④可复核本会话复制结果，也可独立选择源/目标目录并按相对路径核对文件数、缺失/多余项、大小及 SHA-256。校验会重新读取目标内容；已通过手工界面验证同大小目标改写会报告不一致。
+- 阶段⑤在 macOS arm64 构建中嵌入 ExifTool 13.60 与 Perl runtime；启动时验证有效载荷 SHA-256，在权限为 0700 的私有临时目录释放，退出后清理。批量读取所选整理目录或本次复制目标，直接传入 argv 并解析 JSON；不会调用 PATH 中的外部工具。
+- 阶段⑤解析 GPS 纬度/经度及 QuickTime ISO 6709 坐标，校验坐标范围并保留有效的 `0,0`；按 EXIF 原始时间优先、视频 QuickTime 日期回退的顺序记录拍摄时间、精度、原始标签、时区状态和可选相机字段。没有把文件系统时间冒充拍摄时间；支持 `VALID`、`MISSING`、`PARTIAL`、`INVALID`、`UNSUPPORTED`、`READ_ERROR` 状态。
 - 阶段①/③/④完成后提供四选项交接；“不携带”会清除下一阶段会用到的本次清单/结果。运行中切换会询问继续或在安全边界取消后切换；暂停与恢复尚未实现。
 - 已对 `sevenz-rust2` 做单卷 PoC：进程内密码、中文路径/密码、加密头、COPY 数据流和归档顶层目录均通过自读回校验。
 - 文件核心使用有界流式复制、源与临时目标 SHA-256、源扫描戳校验、mtime 保留，以及用同目录 hard-link 防覆盖提交。无法硬链接提交的文件系统会报错，不回退到可能覆盖的写法。
@@ -20,7 +22,7 @@
 | 能力 | 当前结论 | 还需完成 |
 |---|---|---|
 | 原生窗口与文件夹选择 | Rust `eframe` + `rfd` 覆盖 macOS、Windows API；本机 macOS arm64 已实际点选。阶段①—④已通过临时文件夹 GUI 操作验证。 | 干净 Windows、干净 macOS 启动验证；严格单文件启动/分发验证。 |
-| ExifTool | 官方 Windows 可执行发行包内含 Perl；随程序嵌入 EXE 与配套 `exiftool_files` 目录存在可行路径。官方 macOS 安装说明将工具与 `lib` 放在 `/usr/local/bin`，且依赖 Perl；本项目不能假设目标机器有可用 Perl。 | 获取官方发行物并试验将完整 Perl runtime、ExifTool 与模块嵌入一个程序；验证 Apple Silicon/Intel 启动、离线 JSON 输出及许可。未做前阶段⑤保持未实现。 |
+| ExifTool | macOS arm64：官方 ExifTool 13.60 已用 PAR::Packer 1.064 构建为约 15 MB 的独立 Mach-O，嵌入应用后以 argv 批量读取 JSON；程序启动时校验 SHA-256，使用私有临时目录提取并设置 0700 权限。有效载荷运行时清空环境且 `PATH` 不可用，`otool -L` 仅显示 macOS 系统 `libSystem`。在样本上验证 JPEG GPS/拍摄时间、HEIC、MOV、CR2/CR3、NEF、RAF、DNG 和中文空格路径。 | 尚无 Windows / macOS Intel 有效载荷；尚未在干净 Finder/Gatekeeper 环境验收；ExifTool 许可文本已附，但最终发布的许可呈现仍需纳入“关于/开源许可”界面。 |
 | 加密 7z | `sevenz-rust2` 是纯 Rust 7z 编码器；PoC 已验证 COPY、AES-256、加密归档头、中文密码、顶层文件夹及密码回读。密码经进程内 API 传递。 | 仅验证库自身往返，尚未用官方 7-Zip 做互操作；当前 API 未发现原生分卷写入。需先解出可兼容的真实分卷方案，不能以任意切分归档字节冒充分卷。 |
 | HEIC/HEIF 预览解码 | `libheif` 支持 HEIF/AVIF；静态构建和随程序嵌入是待验证路径，解码仍需打包对应 codec。 | 构建与授权审查尚未做；Windows/macOS 两端都要把 libheif 与 HEVC 解码器打入程序并做样本测试。未做前阶段⑥只允许如实显示不支持。 |
 
@@ -28,12 +30,13 @@
 
 - 开发主机：macOS arm64；已安装 Rust 1.99.1，当前仅有 `aarch64-apple-darwin` target。
 - 本机可编译源码，不等于干净 macOS 验收；目前也没有 Windows 构建或干净系统验收证据。
-- 最新本机 Release 构建为约 4.8 MB 的 arm64 Mach-O；`otool -L` 仅列出 macOS 系统框架与系统库。它没有第三方动态库，但尚未作为裸 GUI 文件在干净系统、Finder 或 Gatekeeper 流程中验收。
+- 最新本机 Release 构建为约 20 MB 的 arm64 Mach-O，其中包含约 15 MB 的 ExifTool/Perl 有效载荷；`otool -L` 仅列出 macOS 系统框架与系统库。它尚未作为裸 GUI 文件在干净系统、Finder 或 Gatekeeper 流程中验收。
 - macOS `.app` 是目录形式，不能代替严格单物理文件要求。裸 Mach-O GUI 的系统启动、文件选择器与分发行为尚未验证。
 - 阶段②目前是逐扩展名路由，还没有来源级规则、同名冲突重命名或可用空间 dry run。阶段③目标已存在时只报错，不自动比较同名目标的 SHA-256。
 - 阶段④的独立目录模式按相对路径匹配；Windows 大小写/UNC、macOS Unicode 规范化、权限/扩展属性、超大规模目录和外接盘掉线恢复尚未验收。
-- 尚未接 ExifTool、pHash、独立备份流程或产品内归档 UI。7z PoC 只是一项单卷自读回测试；不满足最终产品功能。
-- 本机 `cargo test`：8 项通过，包括扫描、垃圾过滤、源变更拒绝、流式复制、同大小目标改写识别、加密 Store 7z 单卷 PoC。
+- pHash、独立备份流程和产品内归档 UI 尚未实现。7z PoC 只是一项单卷自读回测试；不满足最终产品功能。
+- ExifTool 有效载荷仅适用于本机 macOS arm64，测试通过不等于 Windows/macOS Intel 或干净系统验收。
+- 本机 `cargo test` 覆盖扫描、垃圾过滤、元数据解析和状态、内置 ExifTool 启动、源变更拒绝、流式复制、同大小目标改写识别、加密 Store 7z 单卷 PoC。具体结果以最近一次构建命令输出为准。
 - 生成的 `target/` 是开发产物，不是经过签名、公证或干净系统离线验收的发布包；不宣称 Windows 或最终单文件交付已达标。
 
 ## 核查资料

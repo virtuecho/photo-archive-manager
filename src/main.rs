@@ -12,10 +12,12 @@ use std::{
 };
 
 pub mod files;
+mod metadata;
 mod pipeline;
 
 use crate::{
     files::FileStamp,
+    metadata::{MetadataRecord, MetadataStatus},
     pipeline::{CopyItemResult, RoutedFile, VerifyItemResult},
 };
 
@@ -87,6 +89,12 @@ struct ExtensionRoute {
 enum WorkKind {
     Copy,
     Verify,
+    Metadata,
+}
+
+enum MetadataInput {
+    Files(Vec<PathBuf>),
+    Directory(PathBuf),
 }
 
 enum WorkMessage {
@@ -107,6 +115,15 @@ enum WorkMessage {
         results: Vec<VerifyItemResult>,
         cancelled: bool,
         coverage: Option<VerifyCoverage>,
+    },
+    MetadataProgress {
+        completed: usize,
+        total: usize,
+    },
+    MetadataComplete {
+        results: Vec<MetadataRecord>,
+        cancelled: bool,
+        error: Option<String>,
     },
 }
 
@@ -138,6 +155,8 @@ struct PhotoArchiveApp {
     verify_coverage: Option<VerifyCoverage>,
     direct_verify_source: Option<PathBuf>,
     direct_verify_target: Option<PathBuf>,
+    metadata_directory: Option<PathBuf>,
+    metadata_results: Vec<MetadataRecord>,
     work_receiver: Option<Receiver<WorkMessage>>,
     work_cancel: Option<Arc<AtomicBool>>,
     work_kind: Option<WorkKind>,
@@ -184,6 +203,8 @@ impl eframe::App for PhotoArchiveApp {
                                 self.copy_stage(ui);
                             } else if self.stage == 3 {
                                 self.verification_stage(ui);
+                            } else if self.stage == 4 {
+                                self.metadata_stage(ui);
                             } else {
                                 self.incomplete_stage(ui);
                             }
@@ -691,6 +712,298 @@ impl PhotoArchiveApp {
         }
     }
 
+    fn metadata_stage(&mut self, ui: &mut eframe::egui::Ui) {
+        ui.label("用随程序内置的 ExifTool 重新读取当前文件；不使用文件系统时间代替拍摄时间，也不改写照片。");
+        ui.weak(metadata::embedded_tool_version());
+        if !metadata::embedded_tool_available() {
+            ui.colored_label(
+                eframe::egui::Color32::DARK_RED,
+                "此构建没有可验证的自包含 ExifTool。阶段⑤在本平台不可用；不会调用系统 PATH 中的工具。",
+            );
+            return;
+        }
+
+        let copied_files = self
+            .copy_results
+            .iter()
+            .filter(|item| item.result.is_ok())
+            .count();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.work_running && copied_files > 0,
+                    eframe::egui::Button::new(format!("检查本次已复制文件（{copied_files}）")),
+                )
+                .clicked()
+            {
+                self.start_metadata_for_copies();
+            }
+            if ui
+                .add_enabled(
+                    !self.work_running,
+                    eframe::egui::Button::new("选择当前整理目录…"),
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    match fs::canonicalize(&path) {
+                        Ok(path) => {
+                            self.metadata_directory = Some(path);
+                            self.metadata_results.clear();
+                        }
+                        Err(error) => {
+                            self.status = format!("无法读取所选目录 {}：{error}", path.display());
+                        }
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.work_running && self.metadata_directory.is_some(),
+                    eframe::egui::Button::new("扫描目录并检查 / 重新检查"),
+                )
+                .clicked()
+            {
+                self.start_metadata_for_directory();
+            }
+            if self.work_running
+                && self.work_kind == Some(WorkKind::Metadata)
+                && ui.button("取消元数据检查").clicked()
+            {
+                if let Some(cancel) = &self.work_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        if let Some(path) = &self.metadata_directory {
+            ui.weak(format!("所选目录：{}", path.display()));
+        }
+        ui.add_space(8.0);
+
+        if !self.status.is_empty() {
+            ui.label(&self.status);
+        }
+        if !self.metadata_results.is_empty() {
+            let valid_gps = self
+                .metadata_results
+                .iter()
+                .filter(|item| item.gps_status == MetadataStatus::Valid)
+                .count();
+            let valid_time = self
+                .metadata_results
+                .iter()
+                .filter(|item| item.time_status == MetadataStatus::Valid)
+                .count();
+            let read_errors = self
+                .metadata_results
+                .iter()
+                .filter(|item| {
+                    item.gps_status == MetadataStatus::ReadError
+                        || item.time_status == MetadataStatus::ReadError
+                })
+                .count();
+            ui.separator();
+            ui.label(format!(
+                "已检查 {} 项 · GPS 有效 {valid_gps} · 拍摄时间有效 {valid_time} · 读取错误 {read_errors}",
+                self.metadata_results.len()
+            ));
+            eframe::egui::ScrollArea::vertical()
+                .id_salt("metadata-results")
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for item in self.metadata_results.iter().take(80) {
+                        ui.group(|ui| {
+                            ui.label(item.path.display().to_string());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!(
+                                    "类型：{}",
+                                    item.file_type.as_deref().unwrap_or("未知")
+                                ));
+                                ui.label(format!("GPS：{}", item.gps_status.label()));
+                                if let (Some(latitude), Some(longitude)) =
+                                    (item.latitude, item.longitude)
+                                {
+                                    ui.label(format!("{latitude:.7}, {longitude:.7}"));
+                                }
+                                if item.gps_zero_zero {
+                                    ui.colored_label(
+                                        eframe::egui::Color32::from_rgb(140, 85, 0),
+                                        "坐标为 0,0，请人工确认",
+                                    );
+                                }
+                                if let Some(source) = &item.gps_source {
+                                    ui.weak(source);
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("拍摄时间：{}", item.time_status.label()));
+                                if let Some(value) = &item.capture_normalized {
+                                    ui.label(value);
+                                    ui.weak(item.capture_precision.as_deref().unwrap_or(""));
+                                    ui.weak(if item.capture_has_timezone {
+                                        "含时区"
+                                    } else {
+                                        "时区未知"
+                                    });
+                                }
+                                if let Some(source) = &item.capture_source {
+                                    ui.weak(source);
+                                }
+                                if let Some(confidence) = item.capture_confidence {
+                                    ui.weak(confidence);
+                                }
+                                if let Some(raw) = &item.capture_raw {
+                                    ui.weak(format!("原始值：{raw}"));
+                                }
+                            });
+                            let camera = [
+                                item.make.as_deref(),
+                                item.model.as_deref(),
+                                item.lens.as_deref(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                            if !camera.is_empty() {
+                                ui.weak(camera);
+                            }
+                            let details = [
+                                item.focal_length
+                                    .as_ref()
+                                    .map(|value| format!("焦距 {value}")),
+                                item.exposure_time
+                                    .as_ref()
+                                    .map(|value| format!("曝光 {value}")),
+                                item.iso.as_ref().map(|value| format!("ISO {value}")),
+                                item.altitude.as_ref().map(|value| format!("海拔 {value}")),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                            if !details.is_empty() {
+                                ui.weak(details);
+                            }
+                            if let Some(error) = &item.error {
+                                ui.colored_label(eframe::egui::Color32::DARK_RED, error);
+                            }
+                        });
+                    }
+                    if self.metadata_results.len() > 80 {
+                        ui.weak(format!(
+                            "另有 {} 项未展开。",
+                            self.metadata_results.len() - 80
+                        ));
+                    }
+                });
+        }
+    }
+
+    fn start_metadata_for_copies(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .copy_results
+            .iter()
+            .filter(|item| item.result.is_ok())
+            .map(|item| item.destination.clone())
+            .collect();
+        if paths.is_empty() {
+            self.status = "没有本次成功复制的目标文件；请选择当前整理目录。".into();
+            return;
+        }
+        self.start_metadata(MetadataInput::Files(paths));
+    }
+
+    fn start_metadata_for_directory(&mut self) {
+        let Some(path) = self.metadata_directory.clone() else {
+            self.status = "请先选择当前整理目录。".into();
+            return;
+        };
+        self.start_metadata(MetadataInput::Directory(path));
+    }
+
+    fn start_metadata(&mut self, input: MetadataInput) {
+        if self.work_running || !metadata::embedded_tool_available() {
+            return;
+        }
+        self.metadata_results.clear();
+        self.work_completed = 0;
+        self.work_total = 0;
+        self.work_bytes = 0;
+        self.work_kind = Some(WorkKind::Metadata);
+        self.work_running = true;
+        self.status = "正在准备 ExifTool 元数据检查…".into();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.work_receiver = Some(receiver);
+        self.work_cancel = Some(cancel);
+        thread::spawn(move || {
+            let (paths, mut scan_error) = match input {
+                MetadataInput::Files(paths) => (paths, None),
+                MetadataInput::Directory(root) => {
+                    let scan = scan_sources(&[root], &worker_cancel, |progress| {
+                        let _ = sender.send(WorkMessage::MetadataProgress {
+                            completed: 0,
+                            total: progress.files,
+                        });
+                    });
+                    match scan {
+                        Ok(summary) => {
+                            let warning = (summary.error_count > 0).then(|| {
+                                format!(
+                                    "目录扫描有 {} 项无法读取；示例：{}",
+                                    summary.error_count,
+                                    summary
+                                        .error_samples
+                                        .first()
+                                        .map(String::as_str)
+                                        .unwrap_or("未提供")
+                                )
+                            });
+                            (
+                                summary.files.into_iter().map(|file| file.path).collect(),
+                                warning,
+                            )
+                        }
+                        Err(_) => {
+                            let _ = sender.send(WorkMessage::MetadataComplete {
+                                results: Vec::new(),
+                                cancelled: true,
+                                error: None,
+                            });
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let total = paths.len();
+            let _ = sender.send(WorkMessage::MetadataProgress {
+                completed: 0,
+                total,
+            });
+            let inspected = metadata::inspect_files(&paths, &worker_cancel, |completed, total| {
+                let _ = sender.send(WorkMessage::MetadataProgress { completed, total });
+            });
+            let (results, cancelled) = match inspected {
+                Ok((results, cancelled)) => (results, cancelled),
+                Err(error) => {
+                    scan_error = Some(match scan_error {
+                        Some(scan_error) => format!("{scan_error}；{error}"),
+                        None => error,
+                    });
+                    (Vec::new(), false)
+                }
+            };
+            let _ = sender.send(WorkMessage::MetadataComplete {
+                results,
+                cancelled,
+                error: scan_error,
+            });
+        });
+    }
+
     fn copy_plan(&self) -> CopyPlan {
         let mut plan = CopyPlan {
             items: Vec::new(),
@@ -1018,6 +1331,71 @@ impl PhotoArchiveApp {
                     }
                     break;
                 }
+                Ok(WorkMessage::MetadataProgress { completed, total }) => {
+                    self.work_completed = completed;
+                    self.work_total = total;
+                }
+                Ok(WorkMessage::MetadataComplete {
+                    results,
+                    cancelled,
+                    error,
+                }) => {
+                    self.work_running = false;
+                    self.work_kind = None;
+                    self.work_receiver = None;
+                    self.work_cancel = None;
+                    self.metadata_results = results;
+                    let passed = self
+                        .metadata_results
+                        .iter()
+                        .filter(|item| {
+                            item.gps_status == MetadataStatus::Valid
+                                && item.time_status == MetadataStatus::Valid
+                        })
+                        .count();
+                    let read_errors = self
+                        .metadata_results
+                        .iter()
+                        .filter(|item| item.gps_status == MetadataStatus::ReadError)
+                        .count();
+                    let warnings = self
+                        .metadata_results
+                        .len()
+                        .saturating_sub(passed + read_errors);
+
+                    if cancelled {
+                        self.status = format!(
+                            "元数据检查已取消：已完成 {} 项；未检查项目可重新运行。",
+                            self.metadata_results.len()
+                        );
+                        self.apply_pending_stage();
+                    } else if self.metadata_results.is_empty() && error.is_some() {
+                        self.status = format!(
+                            "元数据检查未能启动：{}",
+                            error.as_deref().unwrap_or("未知错误")
+                        );
+                        self.apply_pending_stage();
+                    } else {
+                        self.status = format!(
+                            "元数据检查完成：{} 项 PASS，{} 项需人工查看，{} 项读取错误。{}",
+                            passed,
+                            warnings,
+                            read_errors,
+                            error.as_deref().unwrap_or("")
+                        );
+                        self.handoff_title = "元数据检查已完成".into();
+                        self.handoff_description = format!(
+                            "已逐项读取 {} 个当前文件的真实元数据：GPS 与拍摄时间均有效 {} 项；警告或不支持 {} 项；读取错误 {} 项。EXIF、GPS 和拍摄时间结果只保留在本次会话内存中。{}",
+                            self.metadata_results.len(),
+                            passed,
+                            warnings,
+                            read_errors,
+                            error.as_deref().unwrap_or("")
+                        );
+                        self.show_handoff = !self.apply_pending_stage();
+                    }
+                    break;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.work_running = false;
@@ -1071,12 +1449,23 @@ impl PhotoArchiveApp {
                 ));
             } else if self.work_running {
                 ui.spinner();
-                ui.label(format!(
-                    "阶段任务：{} / {} 项，已复制 {}",
-                    self.work_completed,
-                    self.work_total,
-                    format_bytes(self.work_bytes)
-                ));
+                let operation = match self.work_kind {
+                    Some(WorkKind::Copy) => format!(
+                        "复制 {} / {} 项，已写入 {}",
+                        self.work_completed,
+                        self.work_total,
+                        format_bytes(self.work_bytes)
+                    ),
+                    Some(WorkKind::Verify) => {
+                        format!("校验 {} / {} 项", self.work_completed, self.work_total)
+                    }
+                    Some(WorkKind::Metadata) => format!(
+                        "读取元数据 {} / {} 项",
+                        self.work_completed, self.work_total
+                    ),
+                    None => "准备阶段任务…".into(),
+                };
+                ui.label(format!("阶段任务：{operation}"));
             } else if self.last_scan.is_some() {
                 ui.label("阶段状态：已扫描（来源文件清单保存在当前会话内存中）");
             } else {
@@ -1257,6 +1646,8 @@ impl PhotoArchiveApp {
                 self.verify_coverage = None;
                 self.direct_verify_source = None;
                 self.direct_verify_target = None;
+                self.metadata_directory = None;
+                self.metadata_results.clear();
                 self.status = "未携带来源清单；下一阶段需重新选择输入。".into();
                 self.stage = (self.stage + 1).min(STAGES.len() - 1);
             }
