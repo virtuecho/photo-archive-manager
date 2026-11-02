@@ -20,7 +20,6 @@ static NEXT_PARTIAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct ArchiveResult {
-    pub output: PathBuf,
     pub volume_paths: Vec<PathBuf>,
     pub volume_count: usize,
     pub file_count: usize,
@@ -488,12 +487,7 @@ pub fn create_and_verify(
         .remove_now()
         .err()
         .map(|error| format!("归档已提交，但临时卷未能清除：{error}"));
-    let output_path = final_paths
-        .first()
-        .cloned()
-        .unwrap_or_else(|| output.clone());
     Ok(ArchiveResult {
-        output: output_path,
         volume_paths: final_paths.clone(),
         volume_count: final_paths.len(),
         file_count: files.len(),
@@ -770,6 +764,33 @@ mod tests {
         path
     }
 
+    fn preserve_test_archive(result: &ArchiveResult) {
+        let Some(destination) = std::env::var_os("PAM_TEST_ARCHIVE_OUTPUT") else {
+            return;
+        };
+        let destination = PathBuf::from(destination);
+        if result.volume_count == 1 {
+            fs::copy(&result.volume_paths[0], destination).unwrap();
+        } else {
+            for (index, volume) in result.volume_paths.iter().enumerate() {
+                fs::copy(volume, volume_path(&destination, index + 1, true)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn volume_reader_rejects_a_missing_required_volume() {
+        let root = test_dir();
+        let first = root.join("archive.7z.001");
+        let missing = root.join("archive.7z.002");
+        fs::write(&first, b"first volume").unwrap();
+
+        let error = VolumeReader::open(&[first, missing]).err().unwrap();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn creates_encrypted_store_with_root_and_stream_verifies_manifest() {
         let root = test_dir();
@@ -791,19 +812,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.file_count, 2);
-        assert!(result.output.exists());
-        if let Some(destination) = std::env::var_os("PAM_TEST_ARCHIVE_OUTPUT") {
-            let destination = PathBuf::from(destination);
-            if result.volume_count == 1 {
-                fs::copy(&result.output, destination).unwrap();
-            } else {
-                for (index, volume) in result.volume_paths.iter().enumerate() {
-                    fs::copy(volume, volume_path(&destination, index + 1, true)).unwrap();
-                }
-            }
-        }
+        assert!(result.volume_paths[0].exists());
+        preserve_test_archive(&result);
         let mut reader =
-            ArchiveReader::open(&result.output, Password::from("中文-password")).unwrap();
+            ArchiveReader::open(&result.volume_paths[0], Password::from("中文-password")).unwrap();
         let mut names = Vec::new();
         reader
             .for_each_entries(|entry, input| {
@@ -815,7 +827,7 @@ mod tests {
         assert!(names.contains(&"Photos".to_string()));
         assert!(names.contains(&"Photos/相机.JPG".to_string()));
         assert!(names.contains(&"Photos/nested/MOV.MOV".to_string()));
-        assert!(!result.output.with_extension("7z.partial").exists());
+        assert!(!result.volume_paths[0].with_extension("7z.partial").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -895,18 +907,18 @@ mod tests {
             &source,
             &output,
             "Photos.7z",
-            "pw",
+            "中文-password",
             100,
             &BTreeSet::new(),
             &AtomicBool::new(false),
             |_, _, _| {},
         )
         .unwrap();
+        preserve_test_archive(&result);
 
         assert!(result.volume_count > 1);
         assert!(
-            result
-                .output
+            result.volume_paths[0]
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
@@ -925,6 +937,47 @@ mod tests {
                 .take(result.volume_count - 1)
                 .all(|path| fs::metadata(path).unwrap().len() == 100)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "streams a sparse file larger than the default 2,000,000,000-byte volume limit"]
+    fn archives_a_single_file_larger_than_the_default_volume_limit() {
+        const VOLUME_BYTES: u64 = 2_000_000_000;
+        let root = test_dir();
+        let source = root.join("Photos");
+        let output = root.join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        File::create(source.join("large.MOV"))
+            .unwrap()
+            .set_len(VOLUME_BYTES + 1)
+            .unwrap();
+
+        let result = create_and_verify(
+            &source,
+            &output,
+            "Photos.7z",
+            "中文-password",
+            VOLUME_BYTES,
+            &BTreeSet::new(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(result.volume_count > 1);
+        assert_eq!(
+            fs::metadata(&result.volume_paths[0]).unwrap().len(),
+            VOLUME_BYTES
+        );
+        assert!(
+            result
+                .volume_paths
+                .iter()
+                .all(|path| fs::metadata(path).unwrap().len() <= VOLUME_BYTES)
+        );
+        preserve_test_archive(&result);
         fs::remove_dir_all(root).unwrap();
     }
 }
