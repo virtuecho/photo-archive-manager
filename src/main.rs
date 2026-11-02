@@ -320,6 +320,7 @@ struct PhotoArchiveApp {
     handoff_description: String,
     show_switch_prompt: bool,
     pending_stage: Option<usize>,
+    pending_pause_switch: bool,
 }
 
 impl eframe::App for PhotoArchiveApp {
@@ -327,6 +328,7 @@ impl eframe::App for PhotoArchiveApp {
         let ctx = ui.ctx().clone();
         self.receive_scan_updates();
         self.receive_work_updates();
+        self.finish_pause_switch_if_ready();
 
         eframe::egui::CentralPanel::default().show(ui, |ui| {
             let available = ui.available_size();
@@ -3309,22 +3311,24 @@ impl PhotoArchiveApp {
     }
 
     fn footer(&mut self, ui: &mut eframe::egui::Ui, ctx: &eframe::egui::Context) {
-        ui.horizontal(|ui| {
-            for (index, label) in STAGES.iter().enumerate() {
-                let marker = if index == self.stage { "●" } else { "○" };
-                if ui
-                    .selectable_label(
-                        index == self.stage,
-                        format!("{} {}\n{}", marker, index + 1, label),
-                    )
-                    .clicked()
-                {
-                    self.request_stage(index);
+        ui.add_enabled_ui(!self.pending_pause_switch, |ui| {
+            ui.horizontal(|ui| {
+                for (index, label) in STAGES.iter().enumerate() {
+                    let marker = if index == self.stage { "●" } else { "○" };
+                    if ui
+                        .selectable_label(
+                            index == self.stage,
+                            format!("{} {}\n{}", marker, index + 1, label),
+                        )
+                        .clicked()
+                    {
+                        self.request_stage(index);
+                    }
                 }
-            }
-            if ui.button("开源许可").clicked() {
-                self.show_licenses = true;
-            }
+                if ui.button("开源许可").clicked() {
+                    self.show_licenses = true;
+                }
+            });
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -3349,7 +3353,9 @@ impl PhotoArchiveApp {
                 });
             } else if self.work_running {
                 ui.spinner();
-                if self
+                if self.pending_pause_switch {
+                    ui.label("等待当前文件到达安全边界…");
+                } else if self
                     .work_control
                     .as_ref()
                     .is_some_and(TaskControl::is_paused)
@@ -3400,7 +3406,9 @@ impl PhotoArchiveApp {
             ui.with_layout(
                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                 |ui| {
-                    if (self.scanning || self.work_running)
+                    if self.pending_pause_switch {
+                        ui.add_enabled(false, eframe::egui::Button::new("等待安全边界…"));
+                    } else if (self.scanning || self.work_running)
                         && let Some(control) =
                             self.cancel_scan.as_ref().or(self.work_control.as_ref())
                     {
@@ -3416,12 +3424,14 @@ impl PhotoArchiveApp {
                             control.set_paused(!paused);
                         }
                     }
-                    if ui.button("下一阶段 →").clicked() {
-                        self.request_stage((self.stage + 1).min(STAGES.len() - 1));
-                    }
-                    if ui.button("← 上一阶段").clicked() {
-                        self.request_stage(self.stage.saturating_sub(1));
-                    }
+                    ui.add_enabled_ui(!self.pending_pause_switch, |ui| {
+                        if ui.button("下一阶段 →").clicked() {
+                            self.request_stage((self.stage + 1).min(STAGES.len() - 1));
+                        }
+                        if ui.button("← 上一阶段").clicked() {
+                            self.request_stage(self.stage.saturating_sub(1));
+                        }
+                    });
                     if self.scanning && ui.button("取消扫描").clicked() {
                         if let Some(control) = &self.cancel_scan {
                             control.cancel();
@@ -3985,6 +3995,7 @@ impl PhotoArchiveApp {
 
     fn apply_pending_stage(&mut self) -> bool {
         self.show_switch_prompt = false;
+        self.pending_pause_switch = false;
         if let Some(stage) = self.pending_stage.take() {
             self.clear_candidate_preview();
             self.stage = stage;
@@ -4001,21 +4012,55 @@ impl PhotoArchiveApp {
             .resizable(false)
             .anchor(eframe::egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("当前操作会在安全边界停止（扫描条目之间，或复制完当前文件后）。暂停并切换尚未实现。");
-                ui.add_space(8.0);
-                if ui.button("继续当前处理").clicked() {
-                    action = Some(false);
-                }
-                if ui.button("取消当前处理并切换阶段").clicked() {
-                    action = Some(true);
+                if self.pending_pause_switch {
+                    ui.label(
+                        "正在等待当前文件或扫描条目到达安全边界；到达后任务会暂停并切换阶段。",
+                    );
+                    if ui.button("取消切换，继续当前任务").clicked() {
+                        action = Some(0);
+                    }
+                } else {
+                    ui.label(
+                        "当前处理会在安全边界暂停或停止（扫描条目之间，或当前文件处理完成后）。",
+                    );
+                    ui.add_space(8.0);
+                    if ui.button("继续当前处理").clicked() {
+                        action = Some(1);
+                    }
+                    if ui.button("暂停后切换阶段").clicked() {
+                        action = Some(2);
+                    }
+                    if ui.button("取消当前处理并切换阶段").clicked() {
+                        action = Some(3);
+                    }
                 }
             });
         match action {
-            Some(false) => {
+            Some(0) => {
                 self.show_switch_prompt = false;
                 self.pending_stage = None;
+                self.pending_pause_switch = false;
+                if let Some(control) = self.cancel_scan.as_ref().or(self.work_control.as_ref()) {
+                    control.set_paused(false);
+                }
             }
-            Some(true) => {
+            Some(1) => {
+                self.show_switch_prompt = false;
+                self.pending_stage = None;
+                if let Some(control) = self.cancel_scan.as_ref().or(self.work_control.as_ref()) {
+                    control.set_paused(false);
+                }
+            }
+            Some(2) => {
+                if let Some(control) = self.cancel_scan.as_ref().or(self.work_control.as_ref()) {
+                    control.set_paused(true);
+                    self.pending_pause_switch = true;
+                    self.status = "正在等待安全边界；到达后任务会暂停并切换阶段。".into();
+                } else {
+                    self.apply_pending_stage();
+                }
+            }
+            Some(3) => {
                 self.show_switch_prompt = false;
                 if let Some(control) = &self.cancel_scan {
                     control.cancel();
@@ -4026,6 +4071,22 @@ impl PhotoArchiveApp {
                 self.status = "已请求安全停止；当前文件完成后切换阶段。".into();
             }
             _ => {}
+        }
+    }
+
+    fn finish_pause_switch_if_ready(&mut self) {
+        let paused_at_boundary = self
+            .cancel_scan
+            .as_ref()
+            .or(self.work_control.as_ref())
+            .is_some_and(TaskControl::is_paused_at_boundary);
+        if self.pending_pause_switch && paused_at_boundary {
+            let destination = self.pending_stage.map_or_else(
+                || "目标阶段".into(),
+                |stage| format!("阶段{}：{}", stage + 1, STAGES[stage]),
+            );
+            self.status = format!("任务已在安全边界暂停；可从底部恢复。已切换到{destination}。");
+            self.apply_pending_stage();
         }
     }
 }
